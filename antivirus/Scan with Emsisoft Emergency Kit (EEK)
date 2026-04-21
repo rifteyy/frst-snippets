@@ -1,0 +1,36 @@
+StartPowerShell:
+# https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+# This snippet downloads Emsisoft Emergency Kit (EEK) from the Emsisoft's official site, updates it, scans with it.
+# Do note that the executable is 300MB and may take some time to download.
+# ---
+# This will scan for malware and PUP's in 1) system memory 2) important folders as documentation says
+# It will scan in compressed archives, in mail archives, in NTFS alternate data streams and use cloud requests
+# ---
+# You can use argument "/delete" to delete found objects including references but this is permanent and irreversible.
+# You can remove the "/quick" argument to do a full scan but that may take longer than what FRST can handle.
+# You can use argument "/quarantine="[folder]"" to put found malware into quarantine, but I personally prefer first verifying the detections.
+$downloadUrl = "https://dl.emsisoft.com/EmsisoftEmergencyKit.exe"
+$systemDrive = $env:SystemDrive
+$frstPath = "$systemDrive\FRST"
+$savePath = "$frstPath\EEK.exe"
+$extractPath = "$frstPath\EEK"
+if (-not (Test-Path $frstPath)) {
+    New-Item -Path $frstPath -ItemType Directory -Force | Out-Null
+}
+if (-not (Test-Path $extractPath)) {
+    New-Item -Path $extractPath -ItemType Directory -Force | Out-Null
+}
+Invoke-WebRequest -Uri $downloadUrl -OutFile $savePath -UseBasicParsing
+$proc = Start-Process -FilePath $savePath -ArgumentList "-s -d`"$extractPath`"" -PassThru
+while (-not (Test-Path "$extractPath\bin64\a2cmd.exe")) { Start-Sleep -Milliseconds 1000 }
+Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+if ([Environment]::Is64BitOperatingSystem) {
+    $a2cmdPath = Join-Path $extractPath "bin64\a2cmd.exe"
+} else {
+    $a2cmdPath = Join-Path $extractPath "bin32\a2cmd.exe"
+}
+Start-Process -FilePath $a2cmdPath -ArgumentList "/update" -Wait -NoNewWindow
+Start-Process -FilePath $a2cmdPath -ArgumentList "/malware /quick /m /t /pup /a /am /cloud=1 /la=`"$frstPath\EEK_scan.log`"" -Wait -NoNewWindow
+Get-Content "$frstPath\EEK_scan.log"
+exit
+EndPowerShell:

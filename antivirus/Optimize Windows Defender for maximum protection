@@ -1,0 +1,48 @@
+StartPowerShell:
+# https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+# Enable real-time protection
+Set-MpPreference -DisableRealtimeMonitoring $false
+# Enable behavioural protection
+Set-MpPreference -DisableBehaviorMonitoring $false
+# Enable PUP detection
+Set-MpPreference -PUAProtection Enabled
+# Enable cloud protection to level 4 - aggressively block unknowns and apply additional protection measures, alternatively use 2 for lower protection or 0 for default
+Set-MpPreference -CloudBlockLevel 4
+# Send advanced information about malicious/unwanted software present on your device
+Set-MpPreference -MAPSReporting 2
+# Send safe samples automatically to Microsoft
+Set-MpPreference -SubmitSamplesConsent 1
+# Enables inspection of HTTP traffic to detect malicious websites
+Set-MpPreference -EnableNetworkProtection Enabled
+# Enables block at first seen
+Set-MpPreference -DisableBlockAtFirstSeen $false
+# Allows scaning of archive files, such as .zip and .cab files for malware/PUP
+Set-MpPreference -DisableArchiveScanning $false
+# Enables automatic scanning of USB & removal drives
+Set-MpPreference -DisableRemovableDriveScanning $false
+# Enables scanning of network files
+Set-MpPreference -DisableScanningNetworkFiles $false
+# Forces signature check before running a scan
+Set-MpPreference -CheckForSignaturesBeforeRunningScan $true
+# Extends cloud check timer from default 10 to 30 seconds
+Set-MpPreference -CloudExtendedTimeout 30
+# Enables automatic scanning of all downloaded files and attachments
+Set-MpPreference -DisableIOAVProtection $false
+# Enables script detection
+Set-MpPreference -DisableScriptScanning $false
+# Disables automatic exclusions from scanning
+Set-MpPreference -DisableAutoExclusions 1
+# Enables scanning of mapped network drives
+Set-MpPreference -DisableScanningMappedNetworkDrivesForFullScan 0
+# Enables scanning of email files
+Set-MpPreference -DisableEmailScanning 0
+# Enables blocking of malicious domains and IP's on DNS level
+Set-MpPreference -EnableDnsSinkhole $true
+# Enables signature updates every 12 hours
+Set-MpPreference -SignatureUpdateInterval 12
+# Enables automatic quarantine for threats labelled as high and severe
+Set-MpPreference -HighThreatDefaultAction Quarantine
+Set-MpPreference -SevereThreatDefaultAction Quarantine
+# Updates signatures
+Update-MpSignature
+EndPowerShell:

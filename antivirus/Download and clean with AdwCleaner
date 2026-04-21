@@ -1,0 +1,14 @@
+StartPowerShell:
+# https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+# Downloads newest AdwCleaner version directly from Malwarebytes, performs an update, scans, cleans and writes the log in console
+# Does not clean preinstalled objects, only PUP/Adware
+# If you would like to delete preinstalled objects, add an argument /preinstalled to the /clean argument
+# If you would like to only scan with it, change the argument from /clean to /scan
+New-Item -ItemType Directory -Force -Path "$env:SystemDrive\AdwCleaner" | Out-Null
+Invoke-WebRequest -Uri "https://adwcleaner.malwarebytes.com/adwcleaner?channel=release" -OutFile "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe"
+Start-Process -FilePath "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe" -ArgumentList "/eula" -Wait -WindowStyle Hidden
+$logFile = "$env:SystemDrive\AdwCleaner\AdwCleanerOutputFRST.txt"
+Start-Process -FilePath "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe" -ArgumentList "/noreboot /clean" -Wait -WindowStyle Hidden -RedirectStandardOutput $logFile
+Get-Content $logFile -Encoding Unicode
+Remove-Item -Path $logFile -Force -ErrorAction SilentlyContinue
+EndPowerShell:

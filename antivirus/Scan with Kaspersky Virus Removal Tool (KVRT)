@@ -1,0 +1,11 @@
+StartBatch:
+rem https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+rem This snippet downloads KVRT (Kaspersky Virus Removal Tool) directly from Kaspersky and scans with it
+rem IMPORTANT: This currently (to my knowledge) scans only the following: System memory, Startup objects, Boot sectors
+rem            To perform a full scan (which possibly may take longer than an hour, so not recommended,) please use the argument "-allvolumes"
+rem It is better to keep it only as a scanner because cleaning modes tend to restart which break the fix process.
+%windir%\System32\curl.exe --silent "https://devbuilds.s.kaspersky-labs.com/devbuilds/KVRT/latest/full/KVRT.exe" -o "C:\FRST\KASVRT.exe"
+C:\FRST\KASVRT.exe -silent -adinsilent -accepteula -processlevel 0 -dontencrypt >> "C:\FRST\KVRT_log.txt"
+type "C:\FRST\KVRT_log.txt"
+exit
+EndBatch:
