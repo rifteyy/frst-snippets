@@ -1,0 +1,34 @@
+StartPowerShell:
+# https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+# This snippet uses Sysinternals Sigcheck to upload file on VirusTotal.
+# Change the line containing the string "INSERTFILEPATHHERE" to the desired filepath
+# ---
+# It displays the following: entropy, file hashes, catalog name & signing chain, VirusTotal scan results and link to it.
+# It is also able to traverse symbolic links and directory junctions.
+# ---
+# NOTE: If the file is not known prior, it gets uploaded to VirusTotal and the result will be available in a few minutes. 
+#       You can search up the report by visiting the URL "https://www.virustotal.com/gui/file/<SHA256>"
+$TempDir = [System.IO.Path]::GetTempPath()
+$ZipPath = Join-Path $TempDir "SigcheckFRST.zip"
+$ExtractPath = Join-Path $TempDir "SigcheckFRST"
+Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sigcheck.zip" -OutFile $ZipPath -UseBasicParsing
+if (Test-Path $ExtractPath) { Remove-Item $ExtractPath -Recurse -Force }
+Expand-Archive -Path $ZipPath -DestinationPath $ExtractPath -Force
+$SigcheckExe = Join-Path $ExtractPath "sigcheck.exe"
+if (Test-Path $SigcheckExe) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $SigcheckExe
+    $psi.Arguments = '-accepteula -a -h -i -m -l -vt -vs -nobanner "INSERTFILEPATHHERE"'
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::Unicode
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $output = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    Write-Output $output
+} else {
+    Write-Host "Error: Sigcheck does not exist"
+}
+Remove-Item $ZipPath -Force
+EndPowerShell:

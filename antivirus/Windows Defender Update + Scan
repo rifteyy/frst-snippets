@@ -1,5 +1,6 @@
 StartPowerShell:
 # https://rifteyy.org - https://github.com/rifteyy/frst-snippets
+# Update signatures
 Update-MpSignature
 # The ScanType can be modified to perform different scans - FullScan, QuickScan
 Start-MpScan -ScanType QuickScan
