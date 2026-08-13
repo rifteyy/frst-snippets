@@ -1,0 +1,8 @@
+Comment: To rebuild the performance counter library values
+CMD: "%WINDIR%\SYSTEM32\lodctr.exe /R"
+CMD: "%WINDIR%\SysWOW64\lodctr.exe /R"
+CMD: "C:\Windows\SYSTEM32\lodctr.exe /R"
+CMD: "C:\Windows\SysWOW64\lodctr.exe /R"
+
+Comment: Resync performance counter library values to WMI as well
+CMD: winmgmt.exe /resyncperf

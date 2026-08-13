@@ -1,0 +1,22 @@
+Comment: This snippet removes all Windows Defender exclusions
+DeleteKey: HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\TemporaryPaths
+StartPowershell:
+Try {
+    $Paths=(Get-MpPreference).ExclusionPath
+    $Extensions=(Get-MpPreference).ExclusionExtension
+    $Processes=(Get-MpPreference).ExclusionProcess
+    
+    foreach ($Path in $Paths) { 
+        Remove-MpPreference -ExclusionPath $Path -force -ErrorAction Stop
+    }
+    foreach ($Extension in $Extensions) { 
+        Remove-MpPreference -ExclusionExtension $Extension -force -ErrorAction Stop
+    }
+    foreach ($Process in $Processes) { 
+        Remove-MpPreference -ExclusionProcess $Process -force -ErrorAction Stop
+    }
+}
+Catch {
+    Write-Error "Error occurred while removing Windows Defender exclusions: $_"
+}
+EndPowershell:

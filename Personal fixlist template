@@ -1,0 +1,1210 @@
+Start::
+SystemRestore: On
+CreateRestorePoint:
+CloseProcesses:
+
+
+
+Comment: Service / Driver Status (thanks to AdvancedSetup)
+Comment: 0 = Boot
+Comment: 1 = System
+Comment: 2 = Automatic
+Comment: 3 = Manual / Demand
+Comment: 4 = Disabled
+
+Comment: R = Running
+Comment: S = Stopped
+Comment: U = Unknown / unable to determine service state cleanly
+
+Comment: === rifteyy's default non-intrusive fixlist template === 
+Comment: The following are done automatically with this fixlist:
+Comment: Hardens Windows Defender (for maximum efficiency DISABLE TAMPER PROTECTION)
+Comment: Checks and corrects the default Windows PATH environmental variable
+Comment: Checks for internet connection, valid DNS
+Comment: Checks for Windows RE status
+Comment: Checks and repairs WMI repository
+Comment: Checks Windows activation status
+Comment: Checks if TPM, Secure Boot are available and their status
+Comment: Restores original Windows services configuration
+Comment: Restores PowerShell execution policy
+Comment: Rebuilds performance counter library values
+Comment: Resynchronizes performance counter library values to WMI
+Comment: Enables file extensions
+Comment: Enables recovery environment
+Comment: Scans with HitmanPro from Sophos
+Comment: Scans and cleans with AdwCleaner from Malwarebytes
+Comment: Lists Windows Defender properties, settings
+Comment: Lists drive info, identify possible damaged drives from Event Logs
+Comment: Lists Discord's "index.js" files that are often targeted by malware (to store and execute malicious code)
+Comment: Lists recent BSOD's
+Comment: Lists all installed applications, folder contents along with SHA256 for purposes of identifying installed app malware
+Comment: Lists 30 recent scheduled tasks
+Comment: Lists recent Run (Windows + R) executed commands, can identify ClickFix attacks
+Comment: Removes unwanted files (e.g. .exe, .com, .dll) from common folders (e.g. C:\ProgramData, AppData\Roaming) - these are not supposed to store any executable file types
+Comment: Removes generic filetypes associated with RenPyLoader from common folders
+Comment: Removes cache from Chrome, Firefox, Opera, Opera GX, Brave, Vivaldi, LibreWolf, Mullvad Browser, Zen and from Roblox, Fortnite, Discord, OBS Studio
+Comment: Removes policies
+Comment: Removes active BITS tasks
+Comment: Resets network
+Comment: Removes proxy servers
+Comment: Removes temporary files
+Comment: Repairs system files
+
+StartPowerShell:
+# Checks default Windows PATH entries and repairs missing ones.
+$ErrorActionPreference = 'Continue'
+
+function Expand-PlainPath {
+    param([string]$Entry)
+    return [Environment]::ExpandEnvironmentVariables($Entry).TrimEnd('\')
+}
+
+# Templates expanded once to plain paths (C:\Windows\..., C:\Users\...)
+$systemDefaults = @(
+    (Expand-PlainPath '%SystemRoot%\system32')
+    (Expand-PlainPath '%SystemRoot%')
+    (Expand-PlainPath '%SystemRoot%\System32\Wbem')
+    (Expand-PlainPath '%SystemRoot%\System32\WindowsPowerShell\v1.0')
+    (Expand-PlainPath '%SystemRoot%\System32\OpenSSH')
+)
+
+$userDefaults = @(
+    (Expand-PlainPath '%USERPROFILE%\AppData\Local\Microsoft\WindowsApps')
+)
+
+function Get-NormalizedPathEntries {
+    param([string]$Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return @() }
+    return @(
+        $Raw -split ';' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object {
+                [Environment]::ExpandEnvironmentVariables($_.Trim().TrimEnd('\')).ToLowerInvariant()
+            }
+    )
+}
+
+function Get-CombinedPathEntries {
+    $machineRaw = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userRaw    = [Environment]::GetEnvironmentVariable('Path', 'User')
+    return Get-NormalizedPathEntries -Raw ($machineRaw + ';' + $userRaw)
+}
+
+function Test-InPath {
+    param(
+        [string]$PlainPath,
+        [string[]]$NormalizedEntries
+    )
+    $key = $PlainPath.TrimEnd('\').ToLowerInvariant()
+    return $NormalizedEntries -contains $key
+}
+
+function Add-ToPath {
+    param(
+        [string]$PlainPath,
+        [ValidateSet('Machine', 'User')]
+        [string]$Scope
+    )
+    # always store plain path, never %VAR% form
+    $toAdd = $PlainPath.TrimEnd('\')
+    $current = [Environment]::GetEnvironmentVariable('Path', $Scope)
+
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        [Environment]::SetEnvironmentVariable('Path', $toAdd, $Scope)
+        return
+    }
+
+    $normalized = Get-NormalizedPathEntries -Raw $current
+    $key = $toAdd.ToLowerInvariant()
+    if ($normalized -contains $key) { return }
+
+    $newPath = $current.TrimEnd(';') + ';' + $toAdd
+    [Environment]::SetEnvironmentVariable('Path', $newPath, $Scope)
+}
+
+function Write-Result {
+    param(
+        [string]$Entry,
+        [string]$Status
+    )
+    $label = $Entry.PadRight(58)
+    Write-Output ("{0}  {1}" -f $label, $Status)
+}
+
+function Repair-AndVerify {
+    param(
+        [string]$PlainPath,
+        [ValidateSet('Machine', 'User')]
+        [string]$Scope
+    )
+
+    if (-not (Test-Path -LiteralPath $PlainPath)) {
+        Write-Result -Entry $PlainPath -Status 'ATTENTION !!! MISSING  (no folder, cannot repair)'
+        return 'failed'
+    }
+
+    if ($Scope -eq 'Machine') {
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
+            IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not $isAdmin) {
+            Write-Result -Entry $PlainPath -Status 'ATTENTION !!! MISSING  (need Admin to repair)'
+            return 'failed'
+        }
+    }
+
+    try {
+        Add-ToPath -PlainPath $PlainPath -Scope $Scope
+    }
+    catch {
+        Write-Result -Entry $PlainPath -Status "ATTENTION !!! MISSING  (repair failed: $_)"
+        return 'failed'
+    }
+
+    # re-query PATH from registry and verify plain path is present
+    $after = Get-CombinedPathEntries
+    if (Test-InPath -PlainPath $PlainPath -NormalizedEntries $after) {
+        Write-Result -Entry $PlainPath -Status 'ATTENTION !!! MISSING  -> repaired (verified)'
+        return 'repaired'
+    }
+
+    Write-Result -Entry $PlainPath -Status 'ATTENTION !!! MISSING  (repair ran, still missing after re-check)'
+    return 'failed'
+}
+
+$combined = Get-CombinedPathEntries
+
+$hadMissing = $false
+$repairFailed = $false
+$repairedList = [System.Collections.Generic.List[string]]::new()
+
+Write-Output 'PATH CHECK'
+Write-Output ('-' * 72)
+
+foreach ($entry in $systemDefaults) {
+    if (Test-InPath -PlainPath $entry -NormalizedEntries $combined) {
+        Write-Result -Entry $entry -Status 'OK'
+        continue
+    }
+
+    $hadMissing = $true
+    $result = Repair-AndVerify -PlainPath $entry -Scope Machine
+    if ($result -eq 'repaired') {
+        [void]$repairedList.Add($entry)
+        $combined = Get-CombinedPathEntries
+    }
+    else {
+        $repairFailed = $true
+    }
+}
+
+foreach ($entry in $userDefaults) {
+    if (Test-InPath -PlainPath $entry -NormalizedEntries $combined) {
+        Write-Result -Entry $entry -Status 'OK'
+        continue
+    }
+
+    $hadMissing = $true
+    $result = Repair-AndVerify -PlainPath $entry -Scope User
+    if ($result -eq 'repaired') {
+        [void]$repairedList.Add($entry)
+        $combined = Get-CombinedPathEntries
+    }
+    else {
+        $repairFailed = $true
+    }
+}
+
+Write-Output ('-' * 72)
+if (-not $hadMissing) {
+    Write-Output 'RESULT: all default PATH entries present'
+}
+elseif ($repairedList.Count -gt 0 -and -not $repairFailed) {
+    Write-Output "RESULT: $($repairedList.Count) missing entry/entries repaired and verified - open a new terminal"
+}
+elseif ($repairedList.Count -gt 0 -and $repairFailed) {
+    Write-Output "RESULT: $($repairedList.Count) verified, some still missing - open a new terminal / run as Admin"
+}
+else {
+    Write-Output 'RESULT: missing entries not repaired (run as Admin for System PATH)'
+}
+
+if ($repairedList.Count -gt 0) {
+    Write-Output ''
+    Write-Output 'REPAIRED:'
+    foreach ($item in $repairedList) {
+        Write-Output "  $item"
+    }
+}
+
+if ($hadMissing -or $repairFailed) {
+    exit 1
+}
+
+exit 0
+EndPowerShell:
+
+Comment: Verify Windows activation
+CMD: cscript c:\windows\system32\slmgr.vbs /xpr & cscript c:\windows\system32\slmgr.vbs /dlv
+
+Comment: Check TPM and Secure Boot status
+StartPowershell:
+[PSCustomObject]@{ "TPM Detected" = (Get-Tpm).TpmPresent; "TPM Enabled" = (Get-Tpm).TpmEnabled; "Secure Boot On" = (Confirm-SecureBootUEFI) }
+EndPowershell:
+
+StartPowerShell:
+# Check for internet connection
+$ErrorActionPreference = 'Continue'
+
+$dnsServers = @(
+    '1.1.1.1'
+    '8.8.8.8'
+)
+
+$hosts = @(
+    'google.com'
+    'cloudflare.com'
+    'malwarebytes.com'
+)
+
+function Write-Result {
+    param(
+        [string]$Label,
+        [string]$Status
+    )
+    Write-Output ("{0}  {1}" -f $Label.PadRight(42), $Status)
+}
+
+function Test-DnsServer {
+    param([string]$Server)
+
+    $pingOk = $false
+    try {
+        $pingOk = Test-Connection -ComputerName $Server -Count 1 -Quiet -ErrorAction SilentlyContinue
+    }
+    catch { }
+
+    $resolveOk = $false
+    try {
+        $result = Resolve-DnsName -Name 'google.com' -Server $Server -Type A -DnsOnly -ErrorAction Stop
+        $ip = ($result | Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
+        if ($ip) { $resolveOk = $true }
+    }
+    catch { }
+
+    # resolve is what matters; ping may be blocked
+    if ($resolveOk) { return 'OK' }
+    if ($pingOk) { return 'FAIL' }
+    return 'FAIL'
+}
+
+function Test-HostReachable {
+    param([string]$HostName)
+
+    try {
+        $dns = Resolve-DnsName -Name $HostName -Type A -ErrorAction Stop
+        $resolvedIp = ($dns | Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
+        if (-not $resolvedIp) { return 'FAIL' }
+    }
+    catch {
+        return 'FAIL'
+    }
+
+    try {
+        $null = Invoke-WebRequest -Uri "https://$HostName" -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 5 -ErrorAction Stop
+        return 'OK'
+    }
+    catch {
+        if ($_.Exception.Response) { return 'OK' }
+        return 'FAIL'
+    }
+}
+
+$failed = 0
+
+Write-Output 'INTERNET CHECK'
+Write-Output ('-' * 72)
+
+Write-Output 'DNS SERVERS'
+foreach ($server in $dnsServers) {
+    $status = Test-DnsServer -Server $server
+    Write-Result -Label $server -Status $status
+    if ($status -eq 'FAIL') { $failed++ }
+}
+
+Write-Output ''
+Write-Output 'HOSTS'
+foreach ($h in $hosts) {
+    $status = Test-HostReachable -HostName $h
+    Write-Result -Label $h -Status $status
+    if ($status -eq 'FAIL') { $failed++ }
+}
+
+Write-Output ('-' * 72)
+if ($failed -eq 0) {
+    Write-Output 'RESULT: all checks passed'
+    exit 0
+}
+
+Write-Output "RESULT: $failed check(s) failed"
+exit 1
+EndPowerShell:
+
+StartPowershell:
+# Replace /scanonly with /clean if you also want to delete items -- however, this will activate a trial license on the system, I do not recommend it
+$hmpExe  = "$env:TEMP\HitmanPro_x64.exe"
+$logFile = "$env:TEMP\HitmanPro_ScanLog.txt"
+Invoke-WebRequest -Uri "https://dl.surfright.nl/HitmanPro_x64.exe" -OutFile $hmpExe -UseBasicParsing
+$proc = Start-Process $hmpExe -ArgumentList "/ews","/scanonly","/noinstall","/log=`"$logFile`"","/logtype=txt" -Wait -PassThru
+if (!(Test-Path $logFile)) { Write-Host "Scan failed (exit $($proc.ExitCode))"; exit 1 }
+Get-Content $logFile -Encoding Unicode
+EndPowershell:
+
+StartPowerShell:
+# Downloads newest AdwCleaner version directly from Malwarebytes, performs an update, scans, cleans and writes the log in console
+# Does not clean preinstalled objects, only PUP/Adware
+# If you would like to delete preinstalled objects, add an argument /preinstalled to the /clean argument
+# If you would like to only scan with it, change the argument from /clean to /scan
+# NOTE: For the sake of users from Asia (primarily China), do not use the clean option. It will very likely remove a lot of their important software.
+New-Item -ItemType Directory -Force -Path "$env:SystemDrive\AdwCleaner" | Out-Null
+Invoke-WebRequest -Uri "https://adwcleaner.malwarebytes.com/adwcleaner?channel=release" -OutFile "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe"
+Start-Process -FilePath "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe" -ArgumentList "/eula" -Wait -WindowStyle Hidden
+$logFile = "$env:SystemDrive\AdwCleaner\AdwCleanerOutputFRST.txt"
+Start-Process -FilePath "$env:SystemDrive\AdwCleaner\AdwCleanerFRST.exe" -ArgumentList "/noreboot /clean" -Wait -WindowStyle Hidden -RedirectStandardOutput $logFile
+Get-Content $logFile -Encoding Unicode
+Remove-Item -Path $logFile -Force -ErrorAction SilentlyContinue
+EndPowerShell:
+
+Comment: List drive info, identify possible damaged drives (thanks to AdvancedSetup from Malwarebytes for parts of these)
+StartPowerShell:
+param(
+    [int]$MaxEvents = 5000
+)
+$GPTTypeMap = @{
+    'EBD0A0A2-B9E5-4433-87C0-68B6B72699C7' = 'Microsoft Basic Data'
+    'E3C9E316-0B5C-4DB8-817D-F92DF00215AE' = 'Microsoft Reserved (MSR)'
+    'DE94BBA4-06D1-4D40-A16A-BFD50179D6AC' = 'Windows Recovery Environment (WinRE)'
+    'C12A7328-F81F-11D2-BA4B-00A0C93EC93B' = 'EFI System Partition'
+    '21686148-6449-6E6F-744E-656564454649' = 'BIOS Boot Partition'
+    'A19D880F-05FC-4D3B-A006-743F0F84911E' = 'OEM Partition'
+    '5808C8AA-7E8F-42E0-85D2-E1E90434CFB3' = 'Cluster Metadata Partition'
+    '48465300-0000-11AA-AA11-00306543ECAC' = 'Apple HFS/HFS+'
+    '7C3457EF-0000-11AA-AA11-00306543ECAC' = 'Apple APFS'
+    '0FC63DAF-8483-4772-8E79-3D69D8477DE4' = 'Linux Filesystem'
+    '0657FD6D-A4AB-43C4-84E5-0933C84B4F4F' = 'Linux Swap'
+    'E6D6D379-F507-44C2-A23C-238F2A3DF928' = 'Linux LVM'
+}
+$MBRTypeMap = @{
+    '01'='FAT12';'04'='FAT16 <32M';'05'='Extended';'06'='FAT16';'07'='IFS/NTFS/exFAT/HPFS';'0B'='FAT32 CHS';'0C'='FAT32 LBA';'0E'='FAT16 LBA'
+    '0F'='Extended LBA';'82'='Linux Swap';'83'='Linux Native';'8E'='Linux LVM';'A5'='FreeBSD';'A6'='OpenBSD';'A8'='Mac OS X';'AB'='Mac OS X Boot'
+    'AF'='Mac OS X HFS';'EE'='EFI GPT Protective';'EF'='EFI System Partition'
+}
+function Get-PartitionTypeInfo {
+    param($Partition)
+
+    $guid = $null
+    if ($Partition.GptType) {
+        $guid = ($Partition.GptType -replace '[{}]', '').ToUpper()
+    }
+    if ([string]::IsNullOrWhiteSpace($guid) -or $guid -eq '00000000-0000-0000-0000-000000000000') {
+        $guid = switch ($Partition.Type) {
+            "System"   { "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" }
+            "Reserved" { "E3C9E316-0B5C-4DB8-817D-F92DF00215AE" }
+            "Basic"    { "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" }
+            "Recovery" { "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC" }
+            default    { $null }
+        }
+    }
+
+    if ($guid) {
+        $name = $GPTTypeMap[$guid]
+        if ($name) { return "$name (GPT GUID: $($guid.ToLower()))" }
+        else { return "Unknown/Custom (GPT GUID: $($guid.ToLower()))" }
+    }
+
+    if ($Partition.MbrType) {
+        $code = ($Partition.MbrType.ToString() -replace '^0x', '').PadLeft(2, '0').ToUpper()
+        $name = $MBRTypeMap[$code]
+        if ($name) { return "$name (MBR code: 0x$code)" }
+        else { return "Unknown/Custom (MBR code: $($Partition.MbrType))" }
+    }
+
+    return $Partition.Type
+}
+function Get-DrMapping {
+    param([int]$MaxEvents)
+    $map = @{}
+    try {
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'disk' } -MaxEvents $MaxEvents -ErrorAction Stop
+    } catch {
+        return $map
+    }
+    foreach ($e in $events) {
+        if ($e.Message -match 'Harddisk(\d+)\\DR(\d+)') {
+            $n  = [int]$Matches[1]
+            $dr = [int]$Matches[2]
+            if (-not $map.ContainsKey($n)) { $map[$n] = $dr }
+        }
+    }
+    return $map
+}
+$drMap = Get-DrMapping -MaxEvents $MaxEvents
+$physicalDisks = Get-PhysicalDisk | Select-Object DeviceId, FriendlyName, SerialNumber, MediaType, @{N='SizeGB';E={[math]::Round($_.Size / 1GB,2)}}
+foreach ($pd in $physicalDisks) {
+    $devId = [int]$pd.DeviceId
+    $drSuffix = if ($drMap.ContainsKey($devId)) { "\DR$($drMap[$devId])" } else { '\DR? (no event seen yet)' }
+
+    Write-Host ""
+    Write-Host "<=== \Device\Harddisk$devId$drSuffix ($($pd.FriendlyName)) ===>"
+    Write-Host "  DeviceId: $devId | Serial: $($pd.SerialNumber) | Media: $($pd.MediaType) | Size: $($pd.SizeGB) GB"
+
+    try {
+        $partitions = Get-Partition -DiskNumber $devId -ErrorAction Stop
+        if (-not $partitions) {
+            Write-Host "  (no partitions found)"
+            continue
+        }
+        foreach ($part in $partitions) {
+            $driveLetter = if ($part.DriveLetter) { "$($part.DriveLetter):" } else { 'no letter' }
+            $sizeGB = [math]::Round($part.Size / 1GB, 2)
+            $typeInfo = Get-PartitionTypeInfo -Partition $part
+            Write-Host "  [PARTITION $($part.PartitionNumber)] Drive: $driveLetter - $sizeGB GB - $typeInfo"
+        }
+    } catch {
+        Write-Host "  [ERROR] cannot read partitions for disk $devId"
+    }
+}
+
+if ($drMap.Count -eq 0) {
+    Write-Host ""
+    Write-Host "Note: no \Device\HarddiskN\DRx entries found in the last $MaxEvents System log events. Increase -MaxEvents, or the DR number will only appear once Windows actually logs a disk event for that drive (e.g. a bad block warning)."
+}
+EndPowerShell:
+
+Comment: Verify that Discord does not have any injected code to intercept personal data. If anything is prompted here, it needs to be checked that it isn't malicious code.
+Powershell: @("$env:APPDATA","$env:LOCALAPPDATA") | ForEach-Object { Get-ChildItem $_ -Recurse -Filter "index.js" -ErrorAction SilentlyContinue } | Where-Object { $_.FullName -match "discord_desktop_core" } | ForEach-Object { Write-Host "--- $($_.FullName) ---"; (Get-Content $_.FullName -Raw).Substring(0,[Math]::Min(2000,(Get-Content $_.FullName -Raw).Length)) }
+
+StartPowerShell:
+# Basic BSOD listings
+$ccKey = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+$cfg = Get-ItemProperty $ccKey -ErrorAction SilentlyContinue
+$dumpTypeMap = @{0='None';1='Complete';2='Kernel';3='Minidump';7='Automatic'}
+Write-Output "--- Configuration ---"
+Write-Output ("Dump Type: {0} ({1})" -f $cfg.CrashDumpEnabled, $dumpTypeMap[$cfg.CrashDumpEnabled])
+Write-Output ("Full Dump Path: {0}" -f $(if($cfg.DumpFile){[Environment]::ExpandEnvironmentVariables($cfg.DumpFile)}else{"$env:SystemRoot\MEMORY.DMP"}))
+Write-Output ("Minidump Folder: {0}" -f $(if($cfg.MinidumpDir){[Environment]::ExpandEnvironmentVariables($cfg.MinidumpDir)}else{"$env:SystemRoot\Minidump"}))
+Write-Output ("Auto Reboot: {0}" -f $(if($cfg.AutoReboot -eq 0){'Disabled'}else{'Enabled'}))
+Write-Output "--- Found Dump Files ---"
+$full = if($cfg.DumpFile){[Environment]::ExpandEnvironmentVariables($cfg.DumpFile)}else{"$env:SystemRoot\MEMORY.DMP"}
+if (Test-Path $full) { Get-Item $full | Select Name,Length,LastWriteTime | Format-Table -AutoSize }
+$mini = if($cfg.MinidumpDir){[Environment]::ExpandEnvironmentVariables($cfg.MinidumpDir)}else{"$env:SystemRoot\Minidump"}
+if (Test-Path $mini) { Get-ChildItem $mini -Filter *.dmp | Select Name,Length,LastWriteTime | Format-Table -AutoSize }
+Write-Output "--- BugCheck Reasoning (recent events) ---"
+$map = @{
+'0x0000000A'='IRQL_NOT_LESS_OR_EQUAL - faulty/outdated driver accessed memory at high IRQL'
+'0x0000001E'='KMODE_EXCEPTION_NOT_HANDLED - unhandled kernel exception, often driver/hardware'
+'0x0000002E'='DATA_BUS_ERROR - typically bad RAM or hardware fault'
+'0x0000003B'='SYSTEM_SERVICE_EXCEPTION - exception in a system service, often driver-related'
+'0x00000050'='PAGE_FAULT_IN_NONPAGED_AREA - bad RAM or faulty driver/antivirus'
+'0x0000007A'='KERNEL_DATA_INPAGE_ERROR - disk-related problem'
+'0x0000007B'='INACCESSIBLE_BOOT_DEVICE - system could not find/access the boot device'
+'0x0000007E'='SYSTEM_THREAD_EXCEPTION_NOT_HANDLED - almost always a faulty driver'
+'0x0000007F'='UNEXPECTED_KERNEL_MODE_TRAP - hardware issue (CPU/RAM/overclocking)'
+'0x0000009F'='DRIVER_POWER_STATE_FAILURE - driver failed to respond to a power state change'
+'0x000000C2'='BAD_POOL_CALLER - driver mishandling memory (pool corruption)'
+'0x000000D1'='DRIVER_IRQL_NOT_LESS_OR_EQUAL - typically a network or GPU driver'
+'0x000000EF'='CRITICAL_PROCESS_DIED - a critical system process died, often malware/system corruption'
+'0x00000116'='VIDEO_TDR_FAILURE - GPU driver failed to respond in time (timeout)'
+'0x00000124'='WHEA_UNCORRECTABLE_ERROR - hardware fault (CPU/RAM/PSU/overclocking)'
+'0x00000133'='DPC_WATCHDOG_VIOLATION - faulty driver or storage subsystem issue'
+'0x00000139'='KERNEL_SECURITY_CHECK_FAILURE - corrupted kernel structure, possibly malware'
+}
+$events = Get-WinEvent -FilterHashtable @{LogName='System';Id=1001} -MaxEvents 100 -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProviderName -match 'WER-SystemErrorReporting' } | Select-Object -First 5
+
+if (-not $events) { Write-Output "No BugCheck events found in the log." }
+foreach ($ev in $events) {
+    $code = if ($ev.Message -match 'bugcheck was:\s*(0x[0-9A-Fa-f]+)') { $matches[1] } else { $null }
+    Write-Output ("Time: {0}" -f $ev.TimeCreated)
+    Write-Output ("Code: {0}" -f $(if($code){$code}else{'not recognized'}))
+    if ($code -and $map.ContainsKey($code.ToUpper())) {
+        Write-Output ("Meaning: {0}" -f $map[$code.ToUpper()])
+    } elseif ($code) {
+        Write-Output "Meaning: unknown code, look up at learn.microsoft.com/windows-hardware/drivers/debugger/bug-check-code-reference2"
+    }
+    Write-Output ""
+}
+EndPowerShell:
+
+StartPowerShell:
+# This snippet lists all installed apps and their folder contents along with SHA256 hashes. Useful for troubleshooting malware abusing installed app entry.
+param(
+    [switch]$Recurse,
+    [int]$MaxFilesPerApp = [int]::MaxValue
+)
+
+$uninstallPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+
+$script:msiInstaller = $null
+function Get-MsiInstallLocation {
+    param([string]$ProductCode)
+    if (-not $script:msiInstaller) {
+        try { $script:msiInstaller = New-Object -ComObject WindowsInstaller.Installer } catch { return $null }
+    }
+    try {
+        $loc = $script:msiInstaller.ProductInfo($ProductCode, 'InstallLocation')
+        if ([string]::IsNullOrWhiteSpace($loc)) { $loc = $script:msiInstaller.ProductInfo($ProductCode, 'InstallSource') }
+        if ([string]::IsNullOrWhiteSpace($loc)) { return $null }
+        return $loc
+    } catch { return $null }
+}
+
+function Get-CleanPath {
+    param([string]$RawValue)
+    if ([string]::IsNullOrWhiteSpace($RawValue)) { return $null }
+    $s = $RawValue.Trim()
+    if ($s.StartsWith('"')) {
+        $endQuote = $s.IndexOf('"', 1)
+        if ($endQuote -gt 0) { return $s.Substring(1, $endQuote - 1) }
+    }
+    if ($s -match '^(.*?\.exe)\b') { return $Matches[1] }
+    return $s
+}
+
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N2} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N2} KB' -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+
+$script:PeExtensions = @('.exe', '.dll', '.sys', '.ocx', '.cpl', '.scr', '.drv', '.efi', '.msi', '.msp', '.msu')
+function Test-IsPeFile {
+    param([string]$Extension)
+    return $script:PeExtensions -contains $Extension.ToLower()
+}
+
+function Get-SignatureInfo {
+    param([string]$Path, [string]$Extension)
+    if (-not (Test-IsPeFile -Extension $Extension)) {
+        return [PSCustomObject]@{ Signer = 'N/A (not PE)'; Status = 'NotApplicable'; Valid = $false }
+    }
+    $result = [PSCustomObject]@{ Signer = 'Unsigned'; Status = 'NotSigned'; Valid = $false }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $result.Status = $sig.Status.ToString()
+        $result.Valid  = ($sig.Status -eq 'Valid')
+        if ($sig.SignerCertificate) {
+            if ($sig.SignerCertificate.Subject -match 'CN=([^,]+)') { $result.Signer = $Matches[1].Trim('"') }
+            else { $result.Signer = $sig.SignerCertificate.Subject }
+            if (-not $result.Valid) { $result.Signer += " [INVALID: $($result.Status)]" }
+        } elseif ($sig.Status -eq 'NotSigned') {
+            $result.Signer = 'Unsigned'
+        } else {
+            $result.Signer = "Unknown [$($result.Status)]"
+        }
+    } catch {
+        $result.Signer = 'Verification error'
+        $result.Status = 'Error'
+        $result.Valid  = $false
+    }
+    return $result
+}
+
+$rawApps = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -and $_.DisplayName.Trim() -ne '' } |
+    Select-Object @{Name = 'Name'; Expression = { $_.DisplayName } },
+                  @{Name = 'Version'; Expression = { $_.DisplayVersion } },
+                  @{Name = 'Publisher'; Expression = { $_.Publisher } },
+                  @{Name = 'InstallFolder'; Expression = {
+                        if ($_.InstallLocation -and $_.InstallLocation.Trim() -ne '') { $_.InstallLocation }
+                        elseif ($_.UninstallString -match 'MsiExec\.exe.*?(\{[0-9A-Fa-f\-]{36}\})') {
+                            $productCode = $Matches[1]
+                            $msiLoc = Get-MsiInstallLocation -ProductCode $productCode
+                            if ($msiLoc) { $msiLoc } else { "MSI: $productCode (location not found)" }
+                        }
+                        elseif ($_.UninstallString) { $_.UninstallString }
+                        else { 'N/A' }
+                    } } |
+    Sort-Object Name -Unique
+
+foreach ($app in $rawApps) {
+    $versionText   = if ($app.Version) { $app.Version } else { '?' }
+    $publisherText = if ($app.Publisher) { $app.Publisher } else { '?' }
+    Write-Host ""
+    Write-Host "<=== $($app.Name) [$versionText] ($publisherText) ===>"
+
+    if ($app.InstallFolder -eq 'N/A' -or $app.InstallFolder -match '^MSI: .* \(location not found\)$') {
+        Write-Host "  Path: $($app.InstallFolder)"
+        continue
+    }
+
+    $cleanPath = Get-CleanPath -RawValue $app.InstallFolder
+
+    $exists = $false
+    try {
+        $exists = Test-Path -LiteralPath $cleanPath -ErrorAction Stop
+    } catch [System.UnauthorizedAccessException] {
+        Write-Host "  Path: $cleanPath"
+        Write-Host "  [ACCESS DENIED]"
+        continue
+    } catch {
+        Write-Host "  Path: $cleanPath"
+        Write-Host "  [ERROR] cannot access"
+        continue
+    }
+
+    if (-not $exists) {
+        Write-Host "  Path: $cleanPath"
+        Write-Host "  [NOT FOUND]"
+        continue
+    }
+
+    $rootItem = Get-Item -LiteralPath $cleanPath -Force
+    $created  = $rootItem.CreationTime.ToString('dd/MM/yyyy HH:mm:ss')
+    $modified = $rootItem.LastWriteTime.ToString('dd/MM/yyyy HH:mm:ss')
+
+    if ($rootItem.PSIsContainer) {
+        $subFolders = Get-ChildItem -LiteralPath $cleanPath -Directory -Force -ErrorAction SilentlyContinue
+        $gciParams  = @{ LiteralPath = $cleanPath; File = $true; Force = $true; ErrorAction = 'SilentlyContinue' }
+        if ($Recurse) { $gciParams['Recurse'] = $true }
+        $allFiles = Get-ChildItem @gciParams
+
+        Write-Host "  Path: $cleanPath | Created: $created | Modified: $modified | Files: $($allFiles.Count) | Folders: $($subFolders.Count)"
+
+        foreach ($dir in $subFolders) {
+            $dCreated  = $dir.CreationTime.ToString('dd/MM/yyyy HH:mm:ss')
+            $dModified = $dir.LastWriteTime.ToString('dd/MM/yyyy HH:mm:ss')
+            $dFileCount = (Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue).Count
+            Write-Host ("  [DIR] {0} - {1} - {2,10} - {3}" -f $dCreated, $dModified, "$dFileCount files", $dir.FullName)
+        }
+    } else {
+        $allFiles = @($rootItem)
+        Write-Host "  Path: $cleanPath | Created: $created | Modified: $modified | Files: 1"
+    }
+
+    if ($allFiles.Count -eq 0) { continue }
+
+    $shown = $allFiles | Select-Object -First $MaxFilesPerApp
+    foreach ($f in $shown) {
+        $hash = 'N/A'
+        try { $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $hash = 'HASH-ERROR' }
+        $size     = Format-FileSize -Bytes $f.Length
+        $fcreated = $f.CreationTime.ToString('dd/MM/yyyy HH:mm:ss')
+        $fmod     = $f.LastWriteTime.ToString('dd/MM/yyyy HH:mm:ss')
+        $sigInfo  = Get-SignatureInfo -Path $f.FullName -Extension $f.Extension
+        Write-Host ("  [{0}] {1} - {2} - {3,10} - Signer: {4} - {5}" -f $hash, $fcreated, $fmod, $size, $sigInfo.Signer, $f.FullName)
+    }
+}
+EndPowerShell:
+
+Comment: List 30 recent scheduled tasks
+Powershell: Get-ScheduledTask | select -first 30 | Get-ScheduledTaskInfo
+
+Comment: List recent Run (Windows + R) executed commands, useful for identifying ClickFix attacks
+Powershell: (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -ErrorAction SilentlyContinue).PSObject.Properties | Where-Object { $_.Name -match "^[a-z]$" } | ForEach-Object { Write-Host "$($_.Name): $($_.Value)" }
+
+Comment: Remove unwanted files from common folders using native removal power of Farbar to include remove on reboot if needed. Please double check the user does not have any applications incorrectly installed in the directories listed below.
+C:\ProgramData\*.csproj
+C:\ProgramData\*.a3x
+C:\ProgramData\*.ahk
+C:\ProgramData\*.au3
+C:\ProgramData\*.bat
+C:\ProgramData\*.cab
+C:\ProgramData\*.cmd
+C:\ProgramData\*.com
+C:\ProgramData\*.dll
+C:\ProgramData\*.exe
+C:\ProgramData\*.hta
+C:\ProgramData\*.jar
+C:\ProgramData\*.js
+C:\ProgramData\*.jse
+C:\ProgramData\*.lnk
+C:\ProgramData\*.pif
+C:\ProgramData\*.ps1
+C:\ProgramData\*.py
+C:\ProgramData\*.pyc
+C:\ProgramData\*.pyd
+C:\ProgramData\*.scr
+C:\ProgramData\*.tmp
+C:\ProgramData\*.vbe
+C:\ProgramData\*.vbs
+C:\ProgramData\*.wsf
+C:\ProgramData\*.wsh
+C:\ProgramData\*.zip
+C:\ProgramData\*.rar
+C:\ProgramData\*.7z
+C:\Users\*\AppData\Roaming\*.csproj
+C:\Users\*\AppData\Roaming\*.au3
+C:\Users\*\AppData\Roaming\*.bat
+C:\Users\*\AppData\Roaming\*.cab
+C:\Users\*\AppData\Roaming\*.cmd
+C:\Users\*\AppData\Roaming\*.com
+C:\Users\*\AppData\Roaming\*.dll
+C:\Users\*\AppData\Roaming\*.exe
+C:\Users\*\AppData\Roaming\*.hta
+C:\Users\*\AppData\Roaming\*.jar
+C:\Users\*\AppData\Roaming\*.js
+C:\Users\*\AppData\Roaming\*.jse
+C:\Users\*\AppData\Roaming\*.lnk
+C:\Users\*\AppData\Roaming\*.pif
+C:\Users\*\AppData\Roaming\*.ps1
+C:\Users\*\AppData\Roaming\*.py
+C:\Users\*\AppData\Roaming\*.pyc
+C:\Users\*\AppData\Roaming\*.pyd
+C:\Users\*\AppData\Roaming\*.scr
+C:\Users\*\AppData\Roaming\*.tmp
+C:\Users\*\AppData\Roaming\*.vbe
+C:\Users\*\AppData\Roaming\*.vbs
+C:\Users\*\AppData\Roaming\*.wsf
+C:\Users\*\AppData\Roaming\*.wsh
+C:\Users\*\AppData\Roaming\*.zip
+C:\Users\*\AppData\Roaming\*.rar
+C:\Users\*\AppData\Roaming\*.7z
+C:\Users\CurrentUserName\AppData\Local\*.csproj
+C:\Users\CurrentUserName\AppData\Local\*.a3x
+C:\Users\CurrentUserName\AppData\Local\*.ahk
+C:\Users\CurrentUserName\AppData\Local\*.au3
+C:\Users\CurrentUserName\AppData\Local\*.bat
+C:\Users\CurrentUserName\AppData\Local\*.cab
+C:\Users\CurrentUserName\AppData\Local\*.cmd
+C:\Users\CurrentUserName\AppData\Local\*.com
+C:\Users\CurrentUserName\AppData\Local\*.dll
+C:\Users\CurrentUserName\AppData\Local\*.exe
+C:\Users\CurrentUserName\AppData\Local\*.hta
+C:\Users\CurrentUserName\AppData\Local\*.jar
+C:\Users\CurrentUserName\AppData\Local\*.js
+C:\Users\CurrentUserName\AppData\Local\*.jse
+C:\Users\CurrentUserName\AppData\Local\*.lnk
+C:\Users\CurrentUserName\AppData\Local\*.pif
+C:\Users\CurrentUserName\AppData\Local\*.ps1
+C:\Users\CurrentUserName\AppData\Local\*.py
+C:\Users\CurrentUserName\AppData\Local\*.pyc
+C:\Users\CurrentUserName\AppData\Local\*.pyd
+C:\Users\CurrentUserName\AppData\Local\*.scr
+C:\Users\CurrentUserName\AppData\Local\*.tmp
+C:\Users\CurrentUserName\AppData\Local\*.vbe
+C:\Users\CurrentUserName\AppData\Local\*.vbs
+C:\Users\CurrentUserName\AppData\Local\*.wsf
+C:\Users\CurrentUserName\AppData\Local\*.wsh
+C:\Users\CurrentUserName\AppData\Local\*.zip
+C:\Users\CurrentUserName\AppData\Local\*.rar
+C:\Users\CurrentUserName\AppData\Local\*.7z
+C:\Users\CurrentUserName\AppData\Roaming\*.csproj
+C:\Users\CurrentUserName\AppData\Roaming\*.a3x
+C:\Users\CurrentUserName\AppData\Roaming\*.ahk
+C:\Users\CurrentUserName\AppData\Roaming\*.au3
+C:\Users\CurrentUserName\AppData\Roaming\*.bat
+C:\Users\CurrentUserName\AppData\Roaming\*.cab
+C:\Users\CurrentUserName\AppData\Roaming\*.cmd
+C:\Users\CurrentUserName\AppData\Roaming\*.com
+C:\Users\CurrentUserName\AppData\Roaming\*.dll
+C:\Users\CurrentUserName\AppData\Roaming\*.exe
+C:\Users\CurrentUserName\AppData\Roaming\*.hta
+C:\Users\CurrentUserName\AppData\Roaming\*.jar
+C:\Users\CurrentUserName\AppData\Roaming\*.js
+C:\Users\CurrentUserName\AppData\Roaming\*.jse
+C:\Users\CurrentUserName\AppData\Roaming\*.lnk
+C:\Users\CurrentUserName\AppData\Roaming\*.pif
+C:\Users\CurrentUserName\AppData\Roaming\*.ps1
+C:\Users\CurrentUserName\AppData\Roaming\*.py
+C:\Users\CurrentUserName\AppData\Roaming\*.pyc
+C:\Users\CurrentUserName\AppData\Roaming\*.pyd
+C:\Users\CurrentUserName\AppData\Roaming\*.scr
+C:\Users\CurrentUserName\AppData\Roaming\*.tmp
+C:\Users\CurrentUserName\AppData\Roaming\*.vbe
+C:\Users\CurrentUserName\AppData\Roaming\*.vbs
+C:\Users\CurrentUserName\AppData\Roaming\*.wsf
+C:\Users\CurrentUserName\AppData\Roaming\*.wsh
+C:\Users\CurrentUserName\AppData\Roaming\*.zip
+C:\Users\CurrentUserName\AppData\Roaming\*.rar
+C:\Users\CurrentUserName\AppData\Roaming\*.7z
+
+Comment: RenPyLoader hollowed installed app generic removal
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.cmd
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.props
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.targets
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.tmp
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.csproj
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.user
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.cmd
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.cache
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.config
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.bat
+C:\Users\CurrentUserName\AppData\Local\NVIDIA\GeForce Experience Service\*.cfg
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.props
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.targets
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.tmp
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.csproj
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.user
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.cmd
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.config
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.bat
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\Caches\*.cfg
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.props
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.targets
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.tmp
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.csproj
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.user
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.cmd
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.config
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.bat
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\*.cfg
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.props
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.targets
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.tmp
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.csproj
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.user
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.cmd
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.config
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.bat
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\*.cfg
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.props
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.targets
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.tmp
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.csproj
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.user
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.cmd
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.config
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.bat
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\WebCache\*.cfg
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.props
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.targets
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.tmp
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.csproj
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.user
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.cmd
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.cache
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.config
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.bat
+C:\Users\CurrentUserName\AppData\Roaming\Microsoft\Crypto\*.cfg
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.props
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.targets
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.tmp
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.csproj
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.cmd
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.user
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.cache
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.config
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.bat
+C:\Windows\System32\config\systemprofile\AppData\Local\Microsoft\Windows\INetCache\*.cfg
+
+Comment: Remove cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\
+C:\Users\CurrentUserName\AppData\Local\Roblox\UniversalApp\WebView2\EBWebView\Default\Cache\Cache_Data\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache_4147\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache_4430\
+C:\Users\CurrentUserName\AppData\Roaming\discord\Cache\Cache_Data\
+C:\Users\CurrentUserName\AppData\Roaming\obs-studio\plugin_config\obs-browser\Cache\Cache_Data\
+StartPowerShell:
+$ProfilesDirectory = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList').ProfilesDirectory
+$DisplayNames = @{
+    "chrome"    = "Chrome"
+    "firefox"   = "Firefox"
+    "opera"     = "Opera"
+    "operagx"   = "Opera GX"
+    "brave"     = "Brave"
+    "msedge"    = "Edge"
+    "vivaldi"   = "Vivaldi"
+    "librewolf" = "LibreWolf"
+    "mullvad"   = "Mullvad Browser"
+    "zen"       = "Zen"
+}
+$ProcessNameMap = @{
+    "operagx" = "opera"
+    "mullvad" = "mullvadbrowser"
+}
+$trueCacheNames = @("Cache", "Code Cache", "DawnCache", "GPUCache", "GrShaderCache", "ShaderCache", "Shared Dictionary\cache")
+function Get-CacheDirs {
+    param([string]$BrowserName, [string]$ProfilesDirectory)
+    switch ($BrowserName) {
+        "chrome" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Google\Chrome\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "firefox" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Mozilla\Firefox\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "opera" {
+            $dir1 = "$ProfilesDirectory\*\AppData\Local\Opera Software"
+            $r1 = Get-ChildItem $dir1 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $dir2 = "$ProfilesDirectory\*\AppData\Roaming\Opera Software"
+            $r2 = Get-ChildItem $dir2 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $r1 + $r2
+        }
+        "operagx" {
+            $dir1 = "$ProfilesDirectory\*\AppData\Local\Opera Software\Opera GX Stable"
+            $r1 = Get-ChildItem $dir1 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $dir2 = "$ProfilesDirectory\*\AppData\Roaming\Opera Software\Opera GX Stable"
+            $r2 = Get-ChildItem $dir2 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $r1 + $r2
+        }
+        "brave" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\BraveSoftware\Brave-Browser\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "msedge" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Microsoft\Edge\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "vivaldi" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Vivaldi\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "librewolf" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\LibreWolf\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "mullvad" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Mullvad\MullvadBrowser\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "zen" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\zen\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+    }
+}
+function Format-Size {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N2} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N2} KB' -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+$BrowserKeys = @('chrome', 'firefox', 'opera', 'operagx', 'brave', 'msedge', 'vivaldi', 'librewolf', 'mullvad', 'zen')
+foreach ($key in $BrowserKeys) {
+    $procName = if ($ProcessNameMap.ContainsKey($key)) { $ProcessNameMap[$key] } else { $key }
+    Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 5
+$grandBytes = 0L
+$grandFiles = 0
+$anyFound = $false
+foreach ($key in $BrowserKeys) {
+    $cacheDirs = Get-CacheDirs -BrowserName $key -ProfilesDirectory $ProfilesDirectory
+    if (-not $cacheDirs -or $cacheDirs.Count -eq 0) { continue }
+    $anyFound = $true
+    $displayName = $DisplayNames[$key]
+    $browserBytes = 0L
+    $browserFiles = 0
+    foreach ($cacheDir in $cacheDirs) {
+        if (-not (Test-Path $cacheDir)) { continue }
+        $items = Get-ChildItem -Path $cacheDir -Force -Recurse -ErrorAction SilentlyContinue
+        $files = $items | Where-Object { -not $_.PSIsContainer }
+        $bytes = ($files | Measure-Object -Property Length -Sum).Sum
+        if (-not $bytes) { $bytes = 0 }
+        $browserFiles += $files.Count
+        $browserBytes += $bytes
+        Get-ChildItem -Path "$cacheDir\*" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+    }
+    $grandBytes += $browserBytes
+    $grandFiles += $browserFiles
+    Write-Host ("{0,-16} freed {1,10} ({2} files)" -f $displayName, (Format-Size $browserBytes), $browserFiles)
+}
+if (-not $anyFound) {
+    Write-Host "No cache found for any installed browser."
+}
+Write-Host ""
+Write-Host ("Total freed: {0} ({1} files)" -f (Format-Size $grandBytes), $grandFiles)
+EndPowerShell:
+
+Comment: Windows Recovery Environment (Windows RE) status and enable
+CMD: reagentc.exe /info
+CMD: reagentc.exe /enable
+
+Comment: Disable hidden file extensions
+cmd: reg.exe add "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "HideFileExt" /t REG_DWORD /d 0 /f
+cmd: reg.exe add "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\HideFileExt" /v "CheckedValue" /t REG_DWORD /d 0 /f
+
+Comment: Verify WMI repository, repair & verify again
+CMD: winmgmt.exe /verifyrepository
+CMD: winmgmt.exe /salvagerepository
+CMD: winmgmt.exe /verifyrepository
+
+Comment: To rebuild the performance counter library values
+CMD: "%WINDIR%\SYSTEM32\lodctr.exe /R"
+CMD: "%WINDIR%\SysWOW64\lodctr.exe /R"
+CMD: "C:\Windows\SYSTEM32\lodctr.exe /R"
+CMD: "C:\Windows\SysWOW64\lodctr.exe /R"
+
+Comment: Resync performance counter library values to WMI as well
+CMD: winmgmt.exe /resyncperf
+
+Comment: Force policy removal
+C:\Windows\System32\GroupPolicyUsers
+C:\Windows\System32\GroupPolicy
+CMD: gpupdate.exe /force
+
+
+Comment: Restores and hardens selected Microsoft Defender Antivirus preferences.
+Comment: Tamper Protection must be temporarily disabled before applying these settings.
+Comment: Thanks to AdvancedSetup from Malwarebytes
+DeleteValue: HKLM\SOFTWARE\Microsoft\Windows Defender|DisableAntiSpyware
+DeleteValue: HKLM\SOFTWARE\Microsoft\Windows Defender|DisableAntiVirus
+StartPowerShell:
+# Enable real-time and behavioral protection
+Set-MpPreference -DisableRealtimeMonitoring $false
+Set-MpPreference -DisableBehaviorMonitoring $false
+
+# Enable potentially unwanted application blocking
+Set-MpPreference -PUAProtection Enabled
+
+# Enable cloud-delivered protection and automatic safe-sample submission
+Set-MpPreference -MAPSReporting Advanced
+Set-MpPreference -SubmitSamplesConsent SendSafeSamples
+
+# Use Microsoft's recommended high cloud-blocking level
+Set-MpPreference -CloudBlockLevel High
+
+# Allow additional time for cloud analysis of suspicious files
+Set-MpPreference -CloudExtendedTimeout 30
+
+# Block connections to known malicious or untrusted network destinations
+Set-MpPreference -EnableNetworkProtection Enabled
+
+# Enable Block at First Sight
+Set-MpPreference -DisableBlockAtFirstSeen $false
+
+# Enable archive, removable-drive, network-file, download, and script scanning
+Set-MpPreference -DisableArchiveScanning $false
+Set-MpPreference -DisableRemovableDriveScanning $false
+Set-MpPreference -DisableScanningNetworkFiles $false
+Set-MpPreference -DisableIOAVProtection $false
+Set-MpPreference -DisableScriptScanning $false
+
+# Check for current security intelligence before starting a scan
+Set-MpPreference -CheckForSignaturesBeforeRunningScan $true
+
+# Enable supported DNS attack inspection and sinkholing when available
+if ((Get-Command Set-MpPreference).Parameters.ContainsKey('EnableDnsSinkhole')) {
+    Set-MpPreference -EnableDnsSinkhole $true
+}
+# Sets signature update interval to 12 hours (default 24 hours)
+Set-MpPreference -SignatureUpdateInterval 12
+
+# Update Microsoft Defender security intelligence
+Update-MpSignature
+EndPowerShell:
+
+Comment: List Windows Defender properties, settings
+StartPowerShell:
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "<=== $Title ===>"
+}
+Write-Section "Protection Status"
+Get-MpComputerStatus | Select-Object AMServiceEnabled, AntispywareEnabled, AntivirusEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled, RealTimeProtectionEnabled, IsTamperProtected, NetworkProtectionStatus | Format-List
+Write-Section "Signature / Engine Versions"
+Get-MpComputerStatus | Select-Object AMProductVersion, AMEngineVersion, AntivirusSignatureVersion, AntispywareSignatureVersion | Format-List
+Write-Section "Preferences / Configuration"
+Get-MpPreference | Select-Object PUAProtection, MAPSReporting, SubmitSamplesConsent, CheckForSignaturesBeforeRunningScan, CloudBlockLevel, EnableNetworkProtection, DisableScriptScanning, DisableArchiveScanning, DisableRemovableDriveScanning, DisableScanningNetworkFiles, DisableScanningMappedNetworkDrivesForFullScan, DisableBlockAtFirstSeen, DisableHeuristics, DisableAutoExclusions | Format-List
+Write-Section "Threat Detections"
+$threats = Get-MpThreatDetection
+if ($threats) {
+    $threats | Format-Table -AutoSize
+} else {
+    Write-Host "  (no threat detections found)"
+}
+EndPowerShell:
+
+Comment: Enable recovery environment
+CMD: bcdedit.exe /set {default} recoveryenabled yes
+
+Comment: Restore original Windows services configuration
+StartPowerShell:
+Set-Service -Name "Netlogon" -StartupType Manual
+Set-Service -Name "BITS" -StartupType Manual
+Set-Service -Name "Dhcp" -StartupType Automatic
+Set-Service -Name "EventLog" -StartupType Automatic
+Set-Service -Name "EventSystem" -StartupType Automatic
+Set-Service -Name "nsi" -StartupType Automatic
+Set-Service -Name "RasMan" -StartupType Manual
+Set-Service -Name "SDRSVC" -StartupType Manual
+Set-Service -Name "SstpSvc" -StartupType Manual
+Set-Service -Name "TrustedInstaller" -StartupType Manual
+Set-Service -Name "VSS" -StartupType Manual
+Set-Service -Name "Winmgmt" -StartupType Automatic
+Set-Service -Name "wuauserv" -StartupType Manual
+EndPowerShell:
+
+Comment: Reset the Windows Update download cache and update catalog database
+CMD: net.exe stop bits
+CMD: net.exe stop wuauserv
+CMD: net.exe stop cryptsvc
+CMD: net.exe stop msiserver
+CMD: rd /s /q "%SystemRoot%\SoftwareDistribution"
+CMD: rd /s /q "%SystemRoot%\System32\catroot2"
+CMD: net.exe start msiserver
+CMD: net.exe start cryptsvc
+CMD: net.exe start wuauserv
+CMD: net.exe start bits
+
+Comment: Enable automatic restart after a restart, enable automatic updates
+StartRegedit:
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CrashControl]
+"AutoReboot"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU]
+"NoAutoUpdate"=-
+
+EndRegedit:
+
+Comment: Reset PowerShell execution policy
+Powershell: Set-ExecutionPolicy Unrestricted -Scope CurrentUser -Force
+
+Comment: Fully reset the Windows network stack, WinHTTP proxy settings, DNS cache, and BITS transfer queue.
+Comment: Thanks to AdvancedSetup from Malwarebytes
+StartBatch:
+ipconfig.exe /flushdns
+ipconfig.exe /release
+netsh.exe winsock reset catalog
+netsh.exe int ip reset
+netsh.exe winhttp reset proxy
+netsh.exe winhttp reset autoproxy
+netsh.exe winhttp reset tracing
+EndBatch:
+
+Comment: BITS reset
+Startbatch:
+@echo off
+net.exe stop BITS
+ipconfig.exe /flushdns
+ren "%programdata%\Microsoft\Network\Downloader\qmgr*.*" qmgr*.*.old
+net.exe start BITS
+Endbatch:
+cmd: bitsadmin.exe /reset /allusers
+
+Comment: Additional temp file removal
+C:\Windows\System32\config\systemprofile\AppData\Local\*.tmp
+C:\WINDOWS\system32\*.tmp
+C:\WINDOWS\syswow64\*.tmp
+C:\Users\CurrentUserName\AppData\Local\Temp\*
+C:\Windows\Temp\*
+C:\Windows\SystemTemp\*
+C:\Windows\Prefetch\*
+
+Comment: System repair commands
+CMD: SFC.exe /scannow
+CMD: DISM.exe /Online /Cleanup-image /Restorehealth
+
+Comment: Remove set proxy servers
+RemoveProxy:
+
+Comment: Remove temporary files via FRST
+EmptyTemp:
+
+End::

@@ -1,0 +1,110 @@
+Comment: List drive info, identify possible damaged drives (thanks to AdvancedSetup from Malwarebytes for parts of these)
+StartPowerShell:
+param(
+    [int]$MaxEvents = 2000
+)
+
+$GPTTypeMap = @{
+    'EBD0A0A2-B9E5-4433-87C0-68B6B72699C7' = 'Microsoft Basic Data'
+    'E3C9E316-0B5C-4DB8-817D-F92DF00215AE' = 'Microsoft Reserved (MSR)'
+    'DE94BBA4-06D1-4D40-A16A-BFD50179D6AC' = 'Windows Recovery Environment (WinRE)'
+    'C12A7328-F81F-11D2-BA4B-00A0C93EC93B' = 'EFI System Partition'
+    '21686148-6449-6E6F-744E-656564454649' = 'BIOS Boot Partition'
+    'A19D880F-05FC-4D3B-A006-743F0F84911E' = 'OEM Partition'
+    '5808C8AA-7E8F-42E0-85D2-E1E90434CFB3' = 'Cluster Metadata Partition'
+    '48465300-0000-11AA-AA11-00306543ECAC' = 'Apple HFS/HFS+'
+    '7C3457EF-0000-11AA-AA11-00306543ECAC' = 'Apple APFS'
+    '0FC63DAF-8483-4772-8E79-3D69D8477DE4' = 'Linux Filesystem'
+    '0657FD6D-A4AB-43C4-84E5-0933C84B4F4F' = 'Linux Swap'
+    'E6D6D379-F507-44C2-A23C-238F2A3DF928' = 'Linux LVM'
+}
+$MBRTypeMap = @{
+    '01'='FAT12';'04'='FAT16 <32M';'05'='Extended';'06'='FAT16';'07'='IFS/NTFS/exFAT/HPFS';'0B'='FAT32 CHS';'0C'='FAT32 LBA';'0E'='FAT16 LBA'
+    '0F'='Extended LBA';'82'='Linux Swap';'83'='Linux Native';'8E'='Linux LVM';'A5'='FreeBSD';'A6'='OpenBSD';'A8'='Mac OS X';'AB'='Mac OS X Boot'
+    'AF'='Mac OS X HFS';'EE'='EFI GPT Protective';'EF'='EFI System Partition'
+}
+function Get-PartitionTypeInfo {
+    param($Partition)
+
+    $guid = $null
+    if ($Partition.GptType) {
+        $guid = ($Partition.GptType -replace '[{}]', '').ToUpper()
+    }
+    if ([string]::IsNullOrWhiteSpace($guid) -or $guid -eq '00000000-0000-0000-0000-000000000000') {
+        $guid = switch ($Partition.Type) {
+            "System"   { "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" }
+            "Reserved" { "E3C9E316-0B5C-4DB8-817D-F92DF00215AE" }
+            "Basic"    { "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" }
+            "Recovery" { "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC" }
+            default    { $null }
+        }
+    }
+
+    if ($guid) {
+        $name = $GPTTypeMap[$guid]
+        if ($name) { return "$name (GPT GUID: $($guid.ToLower()))" }
+        else { return "Unknown/Custom (GPT GUID: $($guid.ToLower()))" }
+    }
+
+    if ($Partition.MbrType) {
+        $code = ($Partition.MbrType.ToString() -replace '^0x', '').PadLeft(2, '0').ToUpper()
+        $name = $MBRTypeMap[$code]
+        if ($name) { return "$name (MBR code: 0x$code)" }
+        else { return "Unknown/Custom (MBR code: $($Partition.MbrType))" }
+    }
+
+    return $Partition.Type
+}
+
+function Get-DrMapping {
+    param([int]$MaxEvents)
+    $map = @{}
+    try {
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'disk' } -MaxEvents $MaxEvents -ErrorAction Stop
+    } catch {
+        return $map
+    }
+    foreach ($e in $events) {
+        if ($e.Message -match 'Harddisk(\d+)\\DR(\d+)') {
+            $n  = [int]$Matches[1]
+            $dr = [int]$Matches[2]
+            if (-not $map.ContainsKey($n)) { $map[$n] = $dr }
+        }
+    }
+    return $map
+}
+
+$drMap = Get-DrMapping -MaxEvents $MaxEvents
+
+$physicalDisks = Get-PhysicalDisk | Select-Object DeviceId, FriendlyName, SerialNumber, MediaType, @{N='SizeGB';E={[math]::Round($_.Size / 1GB,2)}}
+
+foreach ($pd in $physicalDisks) {
+    $devId = [int]$pd.DeviceId
+    $drSuffix = if ($drMap.ContainsKey($devId)) { "\DR$($drMap[$devId])" } else { '\DR? (no event seen yet)' }
+
+    Write-Host ""
+    Write-Host "<=== \Device\Harddisk$devId$drSuffix ($($pd.FriendlyName)) ===>"
+    Write-Host "  DeviceId: $devId | Serial: $($pd.SerialNumber) | Media: $($pd.MediaType) | Size: $($pd.SizeGB) GB"
+
+    try {
+        $partitions = Get-Partition -DiskNumber $devId -ErrorAction Stop
+        if (-not $partitions) {
+            Write-Host "  (no partitions found)"
+            continue
+        }
+        foreach ($part in $partitions) {
+            $driveLetter = if ($part.DriveLetter) { "$($part.DriveLetter):" } else { 'no letter' }
+            $sizeGB = [math]::Round($part.Size / 1GB, 2)
+            $typeInfo = Get-PartitionTypeInfo -Partition $part
+            Write-Host "  [PARTITION $($part.PartitionNumber)] Drive: $driveLetter - $sizeGB GB - $typeInfo"
+        }
+    } catch {
+        Write-Host "  [ERROR] cannot read partitions for disk $devId"
+    }
+}
+
+if ($drMap.Count -eq 0) {
+    Write-Host ""
+    Write-Host "Note: no \Device\HarddiskN\DRx entries found in the last $MaxEvents System log events. Increase -MaxEvents, or the DR number will only appear once Windows actually logs a disk event for that drive (e.g. a bad block warning)."
+}
+EndPowerShell:

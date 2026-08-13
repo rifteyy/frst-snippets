@@ -1,0 +1,773 @@
+StartPowerShell:
+#Requires -Version 5.1
+
+$ProductCodes = @(
+    '{PRODUCT_CODE}'
+)
+
+$DoComSweep  = $false
+$DoRawSweep  = $false
+$DoNameSweep = $false
+
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+
+$script:SW = [Diagnostics.Stopwatch]::StartNew()
+
+function W { param([string]$s = '') Write-Output $s }
+
+function H {
+    param([string]$t)
+    W ''
+    W ('-' * 100)
+    W ('{0}   [+{1:N1}s]' -f $t, $script:SW.Elapsed.TotalSeconds)
+    W ('-' * 100)
+}
+
+function KV {
+    param([string]$k, $v)
+    if ($null -eq $v -or "$v" -eq '') { $v = '<none>' }
+    W ('  {0,-24} {1}' -f $k, $v)
+}
+
+function Pack {
+    param([string]$g)
+    $x = ($g -replace '[{}\-\s]', '').ToUpper()
+    if ($x.Length -ne 32) { throw "bad guid: $g" }
+    $o  = -join $x[7..0]
+    $o += -join $x[11..8]
+    $o += -join $x[15..12]
+    for ($i = 16; $i -lt 32; $i += 2) { $o += $x[$i + 1] + $x[$i] }
+    $o
+}
+
+function Native {
+    param([string]$p)
+    $p -replace '^HKLM:\\', 'HKLM\' -replace '^HKCU:\\', 'HKCU\' `
+       -replace '^HKCR:\\', 'HKCR\' -replace '^HKU:\\',  'HKU\'
+}
+
+function DumpKey {
+    param([string]$Path, [string]$Label = '')
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    W (Native $Path)
+    if ($Label) { W "  [$Label]" }
+    $p = Get-ItemProperty -LiteralPath $Path
+    $names = @($p.PSObject.Properties.Name | Where-Object { $_ -notlike 'PS*' } | Sort-Object)
+    if ($names.Count -eq 0) { W '  <no values>' }
+    foreach ($n in $names) {
+        $v = $p.$n
+        if ($v -is [byte[]]) {
+            if ($v.Length -gt 64) {
+                $v = (($v[0..63] | ForEach-Object { $_.ToString('x2') }) -join '') + "... ($($v.Length) bytes)"
+            } else {
+                $v = ($v | ForEach-Object { $_.ToString('x2') }) -join ''
+            }
+        }
+        elseif ($v -is [array]) { $v = $v -join ' ; ' }
+        KV $n $v
+    }
+    W ''
+}
+
+function MsiTable {
+    param([string]$Path, [string]$Query)
+    try {
+        $i  = New-Object -ComObject WindowsInstaller.Installer
+        $db = $i.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $i, @($Path, 0))
+        $v  = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($Query))
+        $v.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $v, $null)
+        while ($r = $v.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $v, $null)) {
+            $n = $r.GetType().InvokeMember('FieldCount', 'GetProperty', $null, $r, $null)
+            , @(for ($k = 1; $k -le $n; $k++) {
+                $r.GetType().InvokeMember('StringData', 'GetProperty', $null, $r, $k)
+            })
+        }
+        $v.GetType().InvokeMember('Close', 'InvokeMethod', $null, $v, $null)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($i)
+    } catch { }
+}
+
+function RootToHive {
+    param($r)
+    switch ("$r") {
+        '-1' { 'HKMU' } '0' { 'HKCR' } '1' { 'HKCU' } '2' { 'HKLM' } '3' { 'HKU' }
+        default { "root$r" }
+    }
+}
+
+function KeyPathPrefixToHive {
+    param([string]$p)
+    switch ($p) {
+        '00' { 'HKCR' } '01' { 'HKCU' } '02' { 'HKLM' } '03' { 'HKU' }
+        '20' { 'HKLM(64)' } '21' { 'HKCU(64)' } '22' { 'HKLM(64)' } '23' { 'HKU(64)' }
+        default { "root$p" }
+    }
+}
+
+$HKLM = [Microsoft.Win32.RegistryHive]::LocalMachine
+$HKCU = [Microsoft.Win32.RegistryHive]::CurrentUser
+$V64  = [Microsoft.Win32.RegistryView]::Registry64
+$V32  = [Microsoft.Win32.RegistryView]::Registry32
+
+function OpenBase {
+    param($Hive, $View)
+    [Microsoft.Win32.RegistryKey]::OpenBaseKey($Hive, $View)
+}
+
+$script:SysDirs = @(
+    "$env:SystemRoot", "$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64",
+    "$env:SystemRoot\System32\drivers", "$env:SystemRoot\System32\wbem",
+    "$env:SystemRoot\WinSxS", "$env:SystemRoot\assembly",
+    "$env:ProgramData", "$env:ProgramData\Microsoft",
+    "$env:ProgramFiles", "${env:ProgramFiles(x86)}",
+    "$env:ProgramFiles\Common Files", "${env:ProgramFiles(x86)}\Common Files",
+    "$env:ProgramFiles\Common Files\Microsoft Shared", "${env:ProgramFiles(x86)}\Common Files\Microsoft Shared",
+    "$env:LOCALAPPDATA", "$env:LOCALAPPDATA\Programs", "$env:APPDATA",
+    "$env:USERPROFILE", 'C:\'
+) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLower() }
+
+function Normalize-Path {
+    param([string]$p)
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+    $s = $p.Trim()
+    if ($s.StartsWith('"')) {
+        $e = $s.IndexOf('"', 1)
+        if ($e -gt 0) { $s = $s.Substring(1, $e - 1) } else { $s = $s.Trim('"') }
+    } else {
+        $m = [regex]::Match($s, '\s+[-/]')
+        if ($m.Success) { $s = $s.Substring(0, $m.Index) }
+    }
+    $s = [Environment]::ExpandEnvironmentVariables($s)
+    $s = ($s -replace '^\\\?\?\\', '' -replace '^@', '').Trim()
+    if ($s -match '^[A-Za-z]:\\')                            { return $s.TrimEnd('\').ToLower() }
+    if ($s -match '^[^\\/:*?"<>|]+\.(dll|exe|ocx|cpl|sys)$') { return $s.ToLower() }
+    return $null
+}
+
+$script:OwnPaths = $null
+$script:OwnNames = $null
+$script:OwnDirs  = @()
+
+function Test-Own {
+    param([string]$c)
+    $n = Normalize-Path $c
+    if (-not $n) { return $false }
+    if ($script:OwnPaths.Contains($n)) { return $true }
+    foreach ($d in $script:OwnDirs) { if ($n.StartsWith($d + '\')) { return $true } }
+    if ($n -notmatch '\\' -and $script:OwnNames.Contains($n)) { return $true }
+    return $false
+}
+
+function Get-FileFacts {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $fi  = Get-Item -LiteralPath $Path
+    $vi  = $fi.VersionInfo
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    [PSCustomObject]@{
+        Size      = $fi.Length
+        Created   = $fi.CreationTime.ToString('yyyy-MM-dd HH:mm:ss')
+        Modified  = $fi.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+        Company   = $vi.CompanyName
+        Product   = $vi.ProductName
+        OrigName  = $vi.OriginalFilename
+        IntName   = $vi.InternalName
+        FileVer   = $vi.FileVersion
+        Desc      = $vi.FileDescription
+        SigStatus = "$($sig.Status)"
+        Signer    = $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject })
+        SHA256    = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    }
+}
+
+W ('=' * 100)
+W ('MSI REGISTRATION FOOTPRINT   {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+W ('HOST {0}   USER {1}' -f $env:COMPUTERNAME, $env:USERNAME)
+W ('OS   {0}' -f (Get-CimInstance Win32_OperatingSystem).Caption)
+W ('ELEVATED {0}' -f (New-Object Security.Principal.WindowsPrincipal(
+        [Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator))
+W ('SWEEPS   com={0}  raw={1}  name={2}' -f $DoComSweep, $DoRawSweep, $DoNameSweep)
+W ('=' * 100)
+
+foreach ($pc in $ProductCodes) {
+
+    $packed  = Pack $pc
+    $shortPc = ($pc -replace '[{}]', '')
+
+    $script:OwnPaths = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:OwnNames = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:OwnDirs  = @()
+
+    $localPkg    = $null
+    $installLoc  = $null
+    $publisher   = $null
+    $displayName = $null
+    $compFiles   = New-Object System.Collections.ArrayList
+    $compRegs    = New-Object System.Collections.ArrayList
+    $touchedKeys = New-Object System.Collections.ArrayList
+
+    W ''
+    W ('=' * 100)
+    W "PRODUCTCODE  $pc"
+    W "PACKED       $packed"
+    W ('=' * 100)
+
+    H '1. UNINSTALL / ARP'
+    $found = $false
+    foreach ($k in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$pc",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$pc",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$pc")) {
+
+        if (-not (Test-Path -LiteralPath $k)) { continue }
+        $found = $true
+        [void]$touchedKeys.Add((Native $k))
+        DumpKey $k
+
+        $p = Get-ItemProperty -LiteralPath $k
+        if (-not $displayName) { $displayName = $p.DisplayName }
+        if (-not $publisher)   { $publisher   = $p.Publisher }
+        if (-not $installLoc)  { $installLoc  = $p.InstallLocation }
+        if (-not $installLoc -and $p.DisplayIcon) {
+            $ic = ($p.DisplayIcon -split ',')[0].Trim('"')
+            if ($ic -match '\\') { $installLoc = Split-Path $ic -Parent }
+        }
+    }
+    if (-not $found) { W '<none>' }
+
+    H '2. INSTALLER BRANCH'
+    $roots = @(
+        "HKLM:\SOFTWARE\Classes\Installer\Products\$packed",
+        "HKLM:\SOFTWARE\Classes\Installer\Features\$packed",
+        "HKLM:\SOFTWARE\Classes\Installer\Patches\$packed"
+    )
+    $bk = OpenBase $HKLM $V64
+    $ud = $bk.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData')
+    if ($ud) {
+        foreach ($sid in $ud.GetSubKeyNames()) {
+            $roots += "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\$sid\Products\$packed"
+        }
+        $ud.Close()
+    }
+    $bk.Close()
+
+    $found = $false
+    foreach ($r in ($roots | Sort-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        $found = $true
+        [void]$touchedKeys.Add((Native $r))
+
+        foreach ($sub in @('', '\InstallProperties', '\SourceList', '\SourceList\Net',
+                           '\SourceList\Media', '\Usage', '\Features', '\Patches')) {
+            DumpKey "$r$sub" $sub.TrimStart('\')
+        }
+
+        $ip = Get-ItemProperty -LiteralPath "$r\InstallProperties"
+        if ($ip) {
+            if (-not $localPkg)    { $localPkg    = $ip.LocalPackage }
+            if (-not $installLoc)  { $installLoc  = $ip.InstallLocation }
+            if (-not $publisher)   { $publisher   = $ip.Publisher }
+            if (-not $displayName) { $displayName = $ip.DisplayName }
+        }
+    }
+    if (-not $found) { W '<none>' }
+
+    W ''
+    W 'RESOLVED:'
+    KV 'DisplayName'     $displayName
+    KV 'Publisher'       $publisher
+    KV 'InstallLocation' $installLoc
+    KV 'LocalPackage'    $localPkg
+
+    H '3. UPGRADECODE MEMBERSHIP'
+    $found = $false
+    foreach ($cfg in @(
+        @{ Path = 'SOFTWARE\Classes\Installer\UpgradeCodes'; Label = 'HKLM\SOFTWARE\Classes\Installer\UpgradeCodes' },
+        @{ Path = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UpgradeCodes'; Label = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UpgradeCodes' })) {
+
+        $bk   = OpenBase $HKLM $V64
+        $root = $bk.OpenSubKey($cfg.Path)
+        if ($root) {
+            foreach ($sub in $root.GetSubKeyNames()) {
+                $k = $root.OpenSubKey($sub)
+                if (-not $k) { continue }
+                if ($k.GetValueNames() -contains $packed) {
+                    $found = $true
+                    W ('{0}\{1}' -f $cfg.Label, $sub)
+                    KV 'upgradecode (packed)' $sub
+                    KV 'member value'         $k.GetValue($packed)
+                    W ''
+                }
+                $k.Close()
+            }
+            $root.Close()
+        }
+        $bk.Close()
+    }
+    if (-not $found) { W '<none>' }
+
+    H '4. COMPONENT REGISTRATION'
+    $found = $false
+    $dirCand = New-Object System.Collections.ArrayList
+    foreach ($cfg in @(
+        @{ Path = 'SOFTWARE\Classes\Installer\Components'; Label = 'HKLM\SOFTWARE\Classes\Installer\Components' },
+        @{ Path = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Components'; Label = 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Components' })) {
+
+        $bk   = OpenBase $HKLM $V64
+        $root = $bk.OpenSubKey($cfg.Path)
+        if ($root) {
+            foreach ($sub in $root.GetSubKeyNames()) {
+                $k = $root.OpenSubKey($sub)
+                if (-not $k) { continue }
+                $vn = $k.GetValueNames()
+                if ($vn -contains $packed) {
+                    $found = $true
+                    $val = "$($k.GetValue($packed))"
+                    W ('{0}\{1}' -f $cfg.Label, $sub)
+                    KV 'componentid' $sub
+                    KV 'keypath'     $val
+                    $shared = @($vn | Where-Object { $_ -and $_ -ne $packed })
+                    if ($shared.Count) { KV 'shared with' ($shared -join ', ') }
+                    W ''
+                    if ($val -match '^\d{2}:') {
+                        [void]$compRegs.Add($val)
+                    } elseif ($val -match '^[A-Za-z]:\\') {
+                        [void]$compFiles.Add($val)
+                        $n = Normalize-Path $val
+                        if ($n) {
+                            [void]$script:OwnPaths.Add($n)
+                            [void]$script:OwnNames.Add([IO.Path]::GetFileName($n))
+                            [void]$dirCand.Add((Split-Path $n -Parent))
+                        }
+                    }
+                }
+                $k.Close()
+            }
+            $root.Close()
+        }
+        $bk.Close()
+    }
+    if (-not $found) { W '<none>' }
+
+    if ($installLoc -and (Test-Path -LiteralPath $installLoc)) {
+        $il = $installLoc.TrimEnd('\').ToLower()
+        if ($script:SysDirs -notcontains $il) {
+            [void]$dirCand.Add($il)
+            Get-ChildItem -LiteralPath $installLoc -Recurse -File | ForEach-Object {
+                [void]$script:OwnPaths.Add($_.FullName.ToLower())
+                [void]$script:OwnNames.Add($_.Name.ToLower())
+            }
+        }
+    }
+
+    $script:OwnDirs = @($dirCand | Where-Object { $_ } | Sort-Object -Unique |
+                        Where-Object { $script:SysDirs -notcontains $_ -and $_.Split('\').Count -ge 3 })
+
+    H '5. MSI DATABASE (cached package)'
+    if ($localPkg -and (Test-Path -LiteralPath $localPkg)) {
+        KV 'package' $localPkg
+        $pf = Get-FileFacts $localPkg
+        if ($pf) {
+            KV 'size'     $pf.Size
+            KV 'created'  $pf.Created
+            KV 'modified' $pf.Modified
+            KV 'sha256'   $pf.SHA256
+        }
+
+        W ''
+        W '[Property]'
+        MsiTable $localPkg 'SELECT Property, Value FROM Property' |
+            ForEach-Object { W ('  {0,-30} {1}' -f $_[0], $_[1]) }
+
+        W ''
+        W '[Registry]  msi row -> live registry state'
+        $rows = @(MsiTable $localPkg 'SELECT Root, Key, Name, Value, Component_ FROM Registry')
+        if ($rows.Count -eq 0) { W '  <empty or unreadable>' }
+        foreach ($row in $rows) {
+            $hive = RootToHive $row[0]
+            $key  = $row[1]
+            $name = $row[2]
+
+            $cands = switch ($hive) {
+                'HKLM' { @("HKLM:\SOFTWARE\$key", "HKLM:\SOFTWARE\WOW6432Node\$key", "HKLM:\$key") }
+                'HKMU' { @("HKLM:\SOFTWARE\$key", "HKLM:\SOFTWARE\WOW6432Node\$key",
+                           "HKCU:\SOFTWARE\$key", "HKLM:\$key") }
+                'HKCU' { @("HKCU:\SOFTWARE\$key", "HKCU:\$key") }
+                'HKCR' { @("HKLM:\SOFTWARE\Classes\$key", "HKLM:\SOFTWARE\Classes\WOW6432Node\$key",
+                           "HKCU:\SOFTWARE\Classes\$key") }
+                default { @("HKLM:\$key") }
+            }
+
+            $hitPath = $null
+            $hitVal  = $null
+            foreach ($lp in $cands) {
+                if (Test-Path -LiteralPath $lp) {
+                    $hitPath = Native $lp
+                    if ($name) {
+                        $lv = (Get-ItemProperty -LiteralPath $lp).$name
+                        if ($null -ne $lv) { $hitVal = "$lv" }
+                    }
+                    break
+                }
+            }
+
+            W ('  {0}  {1}\{2}' -f $(if ($hitPath) { 'PRESENT' } else { 'ABSENT ' }), $hive, $key)
+            if ($name) { KV '  value name' $name }
+            KV '  msi value' $row[3]
+            if ($hitPath) {
+                KV '  live key' $hitPath
+                if ($name) { KV '  live value' $hitVal }
+            }
+            KV '  component' $row[4]
+        }
+
+        W ''
+        W '[Class]'
+        $cls = @(MsiTable $localPkg 'SELECT CLSID, Context, Component_, ProgId_Default, Description FROM Class')
+        if ($cls.Count -eq 0) { W '  <none>' }
+        foreach ($c in $cls) {
+            W ('  {0}  ctx={1}  comp={2}  progid={3}  {4}' -f $c[0], $c[1], $c[2], $c[3], $c[4])
+            foreach ($lp in @("HKLM:\SOFTWARE\Classes\CLSID\$($c[0])",
+                              "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$($c[0])",
+                              "HKCU:\SOFTWARE\Classes\CLSID\$($c[0])")) {
+                if (-not (Test-Path -LiteralPath $lp)) { continue }
+                W ('    LIVE  {0}' -f (Native $lp))
+                foreach ($srv in @('InprocServer32', 'LocalServer32', 'InprocHandler32')) {
+                    if (Test-Path -LiteralPath "$lp\$srv") {
+                        W ('      {0} = {1}' -f $srv, "$((Get-ItemProperty -LiteralPath "$lp\$srv").'(default)')")
+                    }
+                }
+            }
+        }
+
+        W ''
+        W '[ProgId]'
+        $pg = @(MsiTable $localPkg 'SELECT ProgId, Class_, Description FROM ProgId')
+        if ($pg.Count -eq 0) { W '  <none>' }
+        foreach ($g in $pg) {
+            $st = if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\$($g[0])") { 'PRESENT' } else { 'ABSENT ' }
+            W ('  {0}  {1,-40} class={2}  {3}' -f $st, $g[0], $g[1], $g[2])
+        }
+
+        W ''
+        W '[TypeLib]'
+        $tl = @(MsiTable $localPkg 'SELECT LibID, Version, Component_, Description FROM TypeLib')
+        if ($tl.Count -eq 0) { W '  <none>' }
+        foreach ($t in $tl) {
+            $st = if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\TypeLib\$($t[0])") { 'PRESENT' } else { 'ABSENT ' }
+            W ('  {0}  {1}  ver={2}  comp={3}  {4}' -f $st, $t[0], $t[1], $t[2], $t[3])
+        }
+
+        W ''
+        W '[Extension]'
+        $ex = @(MsiTable $localPkg 'SELECT Extension, Component_, ProgId_, MIME_ FROM Extension')
+        if ($ex.Count -eq 0) { W '  <none>' }
+        foreach ($e in $ex) {
+            $st = if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\.$($e[0])") { 'PRESENT' } else { 'ABSENT ' }
+            W ('  {0}  .{1}  comp={2}  progid={3}  mime={4}' -f $st, $e[0], $e[1], $e[2], $e[3])
+        }
+
+        W ''
+        W '[AppId]'
+        $ai = @(MsiTable $localPkg 'SELECT AppId, RemoteServerName, ServiceParameters, DllSurrogate FROM AppId')
+        if ($ai.Count -eq 0) { W '  <none>' }
+        foreach ($a in $ai) {
+            $st = if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\AppID\$($a[0])") { 'PRESENT' } else { 'ABSENT ' }
+            W ('  {0}  {1}  surrogate={2}' -f $st, $a[0], $a[3])
+        }
+
+        W ''
+        W '[Directory]'
+        MsiTable $localPkg 'SELECT Directory, Directory_Parent, DefaultDir FROM Directory' |
+            ForEach-Object { W ('  {0,-28} parent={1,-26} {2}' -f $_[0], $_[1], $_[2]) }
+
+        W ''
+        W '[Component]'
+        MsiTable $localPkg 'SELECT Component, ComponentId, Directory_, Attributes, KeyPath FROM Component' |
+            ForEach-Object { W ('  {0,-30} {1,-40} dir={2,-22} attr={3,-6} key={4}' -f $_[0], $_[1], $_[2], $_[3], $_[4]) }
+
+        W ''
+        W '[File]'
+        MsiTable $localPkg 'SELECT File, Component_, FileName, FileSize, Version FROM File' |
+            ForEach-Object { W ('  {0,-40} comp={1,-30} size={2,-10} ver={3}' -f ($_[2] -split '\|')[-1], $_[1], $_[3], $_[4]) }
+
+        W ''
+        W '[ServiceInstall]'
+        $si = @(MsiTable $localPkg 'SELECT ServiceInstall, Name, DisplayName, ServiceType, StartType, LoadOrderGroup, Dependencies, StartName, Password, Arguments, Component_ FROM ServiceInstall')
+        if ($si.Count -eq 0) { W '  <none>' }
+        foreach ($s in $si) {
+            W ('  {0}  name={1}  disp={2}  type={3}  start={4}  runas={5}  args={6}  comp={7}' -f
+                $s[0], $s[1], $s[2], $s[3], $s[4], $s[7], $s[9], $s[10])
+        }
+
+        W ''
+        W '[CustomAction]'
+        $ca = @(MsiTable $localPkg 'SELECT Action, Type, Source, Target FROM CustomAction')
+        if ($ca.Count -eq 0) { W '  <none>' }
+        foreach ($c in $ca) { W ('  {0,-36} type={1,-8} src={2,-30} target={3}' -f $c[0], $c[1], $c[2], $c[3]) }
+
+        W ''
+        W '[Binary]'
+        $bn = @(MsiTable $localPkg 'SELECT Name FROM Binary')
+        if ($bn.Count -eq 0) { W '  <none>' }
+        foreach ($b in $bn) { W ('  {0}' -f $b[0]) }
+
+        W ''
+        W '[InstallExecuteSequence]'
+        MsiTable $localPkg 'SELECT Action, Condition, Sequence FROM InstallExecuteSequence' |
+            Sort-Object { [int]$_[2] } |
+            ForEach-Object { W ('  {0,-6} {1,-40} {2}' -f $_[2], $_[0], $_[1]) }
+
+        W ''
+        W '[Shortcut]'
+        $sc = @(MsiTable $localPkg 'SELECT Shortcut, Directory_, Name, Target, Arguments FROM Shortcut')
+        if ($sc.Count -eq 0) { W '  <none>' }
+        foreach ($s in $sc) {
+            W ('  {0,-28} dir={1,-22} name={2,-28} target={3} {4}' -f $s[0], $s[1], ($s[2] -split '\|')[-1], $s[3], $s[4])
+        }
+    } else {
+        W '<cached msi unavailable>'
+        KV 'LocalPackage' $localPkg
+    }
+
+    H '6. LIVE COM REGISTRATION'
+    KV 'own files' $script:OwnPaths.Count
+    KV 'own dirs'  $(if ($script:OwnDirs.Count) { $script:OwnDirs -join ' | ' } else { '<none>' })
+    $ign = @($dirCand | Sort-Object -Unique | Where-Object { $script:SysDirs -contains $_ })
+    if ($ign.Count) { KV 'ignored sysdirs' ($ign -join ' | ') }
+    W ''
+
+    if (-not $DoComSweep) {
+        W '<skipped: DoComSweep is false>'
+    } elseif ($script:OwnPaths.Count -eq 0 -and $script:OwnDirs.Count -eq 0) {
+        W '<no product binaries to match against>'
+    } else {
+        $hits = 0
+        foreach ($cfg in @(
+            @{ Hive = $HKLM; View = $V64; Label = 'HKLM(64)' },
+            @{ Hive = $HKLM; View = $V32; Label = 'HKLM(32)' },
+            @{ Hive = $HKCU; View = $V64; Label = 'HKCU' })) {
+
+            $bk   = OpenBase $cfg.Hive $cfg.View
+            $root = $bk.OpenSubKey('SOFTWARE\Classes\CLSID')
+            if ($root) {
+                foreach ($clsid in $root.GetSubKeyNames()) {
+                    $ck = $root.OpenSubKey($clsid)
+                    if (-not $ck) { continue }
+                    $subs = $ck.GetSubKeyNames()
+                    foreach ($srv in @('InprocServer32', 'LocalServer32', 'InprocHandler32')) {
+                        if ($subs -notcontains $srv) { continue }
+                        $sk = $ck.OpenSubKey($srv)
+                        if (-not $sk) { continue }
+                        $raw = "$($sk.GetValue(''))"
+                        if ($raw -and (Test-Own $raw)) {
+                            $hits++
+                            W ('{0}\SOFTWARE\Classes\CLSID\{1}' -f $cfg.Label, $clsid)
+                            KV 'default' "$($ck.GetValue(''))"
+                            KV $srv      $raw
+                            $tm = $sk.GetValue('ThreadingModel')
+                            if ($tm) { KV 'ThreadingModel' $tm }
+                            $ap = $ck.GetValue('AppID')
+                            if ($ap) { KV 'AppID' $ap }
+                            foreach ($e in @('ProgID', 'VersionIndependentProgID', 'TreatAs', 'Elevation')) {
+                                if ($subs -contains $e) {
+                                    $ek = $ck.OpenSubKey($e)
+                                    if ($ek) { KV $e "$($ek.GetValue(''))"; $ek.Close() }
+                                }
+                            }
+                            W ''
+                        }
+                        $sk.Close()
+                    }
+                    $ck.Close()
+                }
+                $root.Close()
+            }
+            $bk.Close()
+        }
+
+        foreach ($cfg in @(
+            @{ Hive = $HKLM; View = $V64; Label = 'HKLM(64)' },
+            @{ Hive = $HKLM; View = $V32; Label = 'HKLM(32)' })) {
+
+            $bk   = OpenBase $cfg.Hive $cfg.View
+            $root = $bk.OpenSubKey('SOFTWARE\Classes\TypeLib')
+            if ($root) {
+                foreach ($lib in $root.GetSubKeyNames()) {
+                    $lk = $root.OpenSubKey($lib)
+                    if (-not $lk) { continue }
+                    foreach ($ver in $lk.GetSubKeyNames()) {
+                        $vk = $lk.OpenSubKey($ver)
+                        if (-not $vk) { continue }
+                        foreach ($plat in ($vk.GetSubKeyNames() | Where-Object { $_ -match '^win(32|64)$' })) {
+                            $pk = $vk.OpenSubKey($plat)
+                            if (-not $pk) { continue }
+                            $d = "$($pk.GetValue(''))"
+                            if ($d -and (Test-Own $d)) {
+                                $hits++
+                                W ('{0}\SOFTWARE\Classes\TypeLib\{1}\{2}\{3}' -f $cfg.Label, $lib, $ver, $plat)
+                                KV 'typelib' $d
+                                W ''
+                            }
+                            $pk.Close()
+                        }
+                        $vk.Close()
+                    }
+                    $lk.Close()
+                }
+                $root.Close()
+            }
+            $bk.Close()
+        }
+
+        if ($hits -eq 0) { W '<none>' }
+    }
+
+    H '7. APP PATHS / REGISTERED APPLICATIONS'
+    if ($script:OwnPaths.Count -eq 0 -and $script:OwnDirs.Count -eq 0) {
+        W '<no product binaries to match against>'
+    } else {
+        $hits = 0
+        foreach ($ap in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths',
+                          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths',
+                          'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths')) {
+            if (-not (Test-Path -LiteralPath $ap)) { continue }
+            Get-ChildItem -LiteralPath $ap | ForEach-Object {
+                $props = Get-ItemProperty -LiteralPath $_.PSPath
+                $d     = "$($props.'(default)')"
+                $path  = "$($props.Path)"
+                if ((Test-Own $d) -or (Test-Own $path) -or
+                    $script:OwnNames.Contains($_.PSChildName.ToLower())) {
+                    $script:hits++
+                    W ('{0}\{1}' -f (Native $ap), $_.PSChildName)
+                    KV 'default' $d
+                    if ($path) { KV 'Path' $path }
+                    W ''
+                }
+            }
+        }
+
+        foreach ($ra in @('HKLM:\SOFTWARE\RegisteredApplications',
+                          'HKCU:\SOFTWARE\RegisteredApplications')) {
+            if (-not (Test-Path -LiteralPath $ra)) { continue }
+            $p = Get-ItemProperty -LiteralPath $ra
+            foreach ($pr in $p.PSObject.Properties) {
+                if ($pr.Name -like 'PS*') { continue }
+                $capKey = "HKLM:\SOFTWARE\$($pr.Value)"
+                if (-not (Test-Path -LiteralPath $capKey)) { continue }
+                $cap = Get-ItemProperty -LiteralPath $capKey
+                if ($cap.ApplicationIcon -and (Test-Own (($cap.ApplicationIcon -split ',')[0]))) {
+                    $script:hits++
+                    W ('{0}  ::  {1} = {2}' -f (Native $ra), $pr.Name, $pr.Value)
+                }
+            }
+        }
+
+        if ($script:hits -eq 0) { W '<none>' }
+    }
+
+    H '8. RAW REGISTRY SWEEP (productcode / packed guid)'
+    if (-not $DoRawSweep) {
+        W '<skipped: DoRawSweep is false>'
+    } else {
+        foreach ($term in @($pc, $shortPc, $packed)) {
+            W "term: $term"
+            $any = $false
+            foreach ($hive in @('HKLM', 'HKCU', 'HKCR', 'HKU')) {
+                $k = & reg.exe query $hive /f "$term" /s /k 2>$null | Where-Object { $_ -match '^HK' }
+                $d = & reg.exe query $hive /f "$term" /s /d 2>$null | Where-Object { $_ -match '^HK' }
+                if ($k) { $any = $true; $k | ForEach-Object { W "  [key]  $_" } }
+                if ($d) { $any = $true; $d | ForEach-Object { W "  [data] $_" } }
+            }
+            if (-not $any) { W '  <none>' }
+            W ''
+        }
+    }
+
+    H '9. RAW REGISTRY SWEEP (displayname / publisher / binaries)'
+    if (-not $DoNameSweep) {
+        W '<skipped: DoNameSweep is false>'
+    } else {
+        $terms = @()
+        if ($displayName) { $terms += $displayName }
+        if ($publisher)   { $terms += $publisher }
+        $script:OwnNames | ForEach-Object { $terms += $_ }
+        $terms = @($terms | Where-Object { $_ -and $_.Length -ge 5 } | Sort-Object -Unique)
+
+        if ($terms.Count -eq 0) { W '<no terms>' }
+        foreach ($term in $terms) {
+            W "term: $term"
+            $any = $false
+            foreach ($hive in @('HKLM', 'HKCU')) {
+                $k = & reg.exe query $hive /f "$term" /s /k 2>$null | Where-Object { $_ -match '^HK' }
+                $d = & reg.exe query $hive /f "$term" /s /d 2>$null | Where-Object { $_ -match '^HK' }
+                if ($k) { $any = $true; $k | ForEach-Object { W "  [key]  $_" } }
+                if ($d) { $any = $true; $d | ForEach-Object { W "  [data] $_" } }
+            }
+            if (-not $any) { W '  <none>' }
+            W ''
+        }
+    }
+
+    H '10. FILES'
+    $fl = @($compFiles | Sort-Object -Unique)
+    if ($installLoc -and (Test-Path -LiteralPath $installLoc)) {
+        Get-ChildItem -LiteralPath $installLoc -Recurse -File | ForEach-Object { $fl += $_.FullName }
+    }
+    $fl = @($fl | Sort-Object -Unique)
+
+    if ($fl.Count -eq 0) { W '<none>' }
+    foreach ($f in $fl) {
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { W "MISSING  $f"; continue }
+        $ff = Get-FileFacts $f
+        W $f
+        KV 'size'        $ff.Size
+        KV 'created'     $ff.Created
+        KV 'modified'    $ff.Modified
+        KV 'company'     $ff.Company
+        KV 'product'     $ff.Product
+        KV 'description' $ff.Desc
+        KV 'origname'    $ff.OrigName
+        KV 'internal'    $ff.IntName
+        KV 'fileversion' $ff.FileVer
+        KV 'signature'   $ff.SigStatus
+        KV 'signer'      $ff.Signer
+        KV 'sha256'      $ff.SHA256
+        W ''
+    }
+
+    H '11a. FLAT - REGISTRY KEYS PRESENT'
+    if ($touchedKeys.Count -eq 0) { W '<none>' }
+    ($touchedKeys | Sort-Object -Unique) | ForEach-Object { W $_ }
+
+    H '11b. FLAT - REGISTRY KEYPATHS FROM COMPONENTS'
+    if ($compRegs.Count -eq 0) { W '<none>' }
+    foreach ($r in ($compRegs | Sort-Object -Unique)) {
+        W ('{0}\{1}' -f (KeyPathPrefixToHive $r.Substring(0, 2)), $r.Substring(3))
+    }
+
+    H '11c. FLAT - FILES'
+    if ($fl.Count -eq 0) { W '<none>' }
+    $fl | ForEach-Object { W $_ }
+
+    H '11d. FLAT - DIRECTORIES'
+    $dl = @()
+    if ($installLoc) { $dl += $installLoc.TrimEnd('\') }
+    $fl | ForEach-Object { $dl += (Split-Path $_ -Parent) }
+    $dl = @($dl | Where-Object { $_ } | Sort-Object -Unique)
+    if ($dl.Count -eq 0) { W '<none>' }
+    foreach ($d in $dl) {
+        $ex = Test-Path -LiteralPath $d -PathType Container
+        $ct = ''
+        if ($ex) { $ct = (Get-Item -LiteralPath $d).CreationTime.ToString('yyyy-MM-dd HH:mm:ss') }
+        W ('{0,-8} {1,-20} {2}' -f $(if ($ex) { 'EXISTS' } else { 'MISSING' }), $ct, $d)
+    }
+}
+
+W ''
+W ('=' * 100)
+W ('END   total {0:N1}s' -f $script:SW.Elapsed.TotalSeconds)
+W ('=' * 100)
+EndPowerShell:

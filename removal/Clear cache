@@ -1,0 +1,121 @@
+Comment: Remove cache
+C:\Users\CurrentUserName\AppData\Local\Microsoft\Windows\INetCache\IE\
+C:\Users\CurrentUserName\AppData\Local\Roblox\UniversalApp\WebView2\EBWebView\Default\Cache\Cache_Data\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache_4147\
+C:\Users\CurrentUserName\AppData\Local\FortniteGame\Saved\webcache_4430\
+C:\Users\CurrentUserName\AppData\Roaming\discord\Cache\Cache_Data\
+C:\Users\CurrentUserName\AppData\Roaming\obs-studio\plugin_config\obs-browser\Cache\Cache_Data\
+StartPowerShell:
+$ProfilesDirectory = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList').ProfilesDirectory
+$DisplayNames = @{
+    "chrome"    = "Chrome"
+    "firefox"   = "Firefox"
+    "opera"     = "Opera"
+    "operagx"   = "Opera GX"
+    "brave"     = "Brave"
+    "msedge"    = "Edge"
+    "vivaldi"   = "Vivaldi"
+    "librewolf" = "LibreWolf"
+    "mullvad"   = "Mullvad Browser"
+    "zen"       = "Zen"
+}
+$ProcessNameMap = @{
+    "operagx" = "opera"
+    "mullvad" = "mullvadbrowser"
+}
+$trueCacheNames = @("Cache", "Code Cache", "DawnCache", "GPUCache", "GrShaderCache", "ShaderCache", "Shared Dictionary\cache")
+function Get-CacheDirs {
+    param([string]$BrowserName, [string]$ProfilesDirectory)
+    switch ($BrowserName) {
+        "chrome" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Google\Chrome\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "firefox" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Mozilla\Firefox\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "opera" {
+            $dir1 = "$ProfilesDirectory\*\AppData\Local\Opera Software"
+            $r1 = Get-ChildItem $dir1 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $dir2 = "$ProfilesDirectory\*\AppData\Roaming\Opera Software"
+            $r2 = Get-ChildItem $dir2 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $r1 + $r2
+        }
+        "operagx" {
+            $dir1 = "$ProfilesDirectory\*\AppData\Local\Opera Software\Opera GX Stable"
+            $r1 = Get-ChildItem $dir1 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $dir2 = "$ProfilesDirectory\*\AppData\Roaming\Opera Software\Opera GX Stable"
+            $r2 = Get-ChildItem $dir2 -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            $r1 + $r2
+        }
+        "brave" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\BraveSoftware\Brave-Browser\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "msedge" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Microsoft\Edge\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "vivaldi" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Vivaldi\User Data"
+            Get-ChildItem $dir -Directory -Recurse -Include $trueCacheNames -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        "librewolf" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\LibreWolf\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "mullvad" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\Mullvad\MullvadBrowser\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+        "zen" {
+            $dir = "$ProfilesDirectory\*\AppData\Local\zen\Profiles"
+            Get-ChildItem $dir -Directory -Recurse -Include "cache2" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '\entries' }
+        }
+    }
+}
+function Format-Size {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N2} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N2} KB' -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+$BrowserKeys = @('chrome', 'firefox', 'opera', 'operagx', 'brave', 'msedge', 'vivaldi', 'librewolf', 'mullvad', 'zen')
+foreach ($key in $BrowserKeys) {
+    $procName = if ($ProcessNameMap.ContainsKey($key)) { $ProcessNameMap[$key] } else { $key }
+    Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 5
+$grandBytes = 0L
+$grandFiles = 0
+$anyFound = $false
+foreach ($key in $BrowserKeys) {
+    $cacheDirs = Get-CacheDirs -BrowserName $key -ProfilesDirectory $ProfilesDirectory
+    if (-not $cacheDirs -or $cacheDirs.Count -eq 0) { continue }
+    $anyFound = $true
+    $displayName = $DisplayNames[$key]
+    $browserBytes = 0L
+    $browserFiles = 0
+    foreach ($cacheDir in $cacheDirs) {
+        if (-not (Test-Path $cacheDir)) { continue }
+        $items = Get-ChildItem -Path $cacheDir -Force -Recurse -ErrorAction SilentlyContinue
+        $files = $items | Where-Object { -not $_.PSIsContainer }
+        $bytes = ($files | Measure-Object -Property Length -Sum).Sum
+        if (-not $bytes) { $bytes = 0 }
+        $browserFiles += $files.Count
+        $browserBytes += $bytes
+        Get-ChildItem -Path "$cacheDir\*" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+    }
+    $grandBytes += $browserBytes
+    $grandFiles += $browserFiles
+    Write-Host ("{0,-16} freed {1,10} ({2} files)" -f $displayName, (Format-Size $browserBytes), $browserFiles)
+}
+if (-not $anyFound) {
+    Write-Host "No cache found for any installed browser."
+}
+Write-Host ""
+Write-Host ("Total freed: {0} ({1} files)" -f (Format-Size $grandBytes), $grandFiles)
+EndPowerShell:
