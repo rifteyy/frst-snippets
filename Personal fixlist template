@@ -1,5 +1,4 @@
 Start::
-SystemRestore: On
 CreateRestorePoint:
 CloseProcesses:
 
@@ -33,6 +32,7 @@ Comment: Enables file extensions
 Comment: Enables recovery environment
 Comment: Scans with HitmanPro from Sophos
 Comment: Scans and cleans with AdwCleaner from Malwarebytes
+Comment: Lists environment variables
 Comment: Lists Windows Defender properties, settings
 Comment: Lists drive info, identify possible damaged drives from Event Logs
 Comment: Lists Discord's "index.js" files that are often targeted by malware (to store and execute malicious code)
@@ -46,9 +46,47 @@ Comment: Removes cache from Chrome, Firefox, Opera, Opera GX, Brave, Vivaldi, Li
 Comment: Removes policies
 Comment: Removes active BITS tasks
 Comment: Resets network
+Comment: Resets icon cache
 Comment: Removes proxy servers
 Comment: Removes temporary files
 Comment: Repairs system files
+
+Comment: List environment variables
+StartPowerShell:
+$key = Get-Item -Path "HKCU:\Environment" -ErrorAction SilentlyContinue
+if ($key) {
+    $path = "HKCU\Environment"
+    foreach ($name in $key.GetValueNames()) {
+        $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        "$path|$name=$value"
+    }
+}
+$key = Get-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -ErrorAction SilentlyContinue
+if ($key) {
+    $path = "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+    foreach ($name in $key.GetValueNames()) {
+        $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        "$path|$name=$value"
+    }
+}
+Get-ChildItem Env: | Sort-Object Name | ForEach-Object {
+    "SET|$($_.Name)=$($_.Value)"
+}
+Get-ChildItem Registry::HKEY_USERS | Where-Object {
+    $_.PSChildName -match '^S-1-5-21-\d+-\d+-\d+-\d+$'
+} | ForEach-Object {
+    $sid = $_.PSChildName
+    $envPath = "Registry::HKEY_USERS\$sid\Environment"
+    
+    if (Test-Path $envPath) {
+        $key = Get-Item -Path $envPath
+        foreach ($name in $key.GetValueNames()) {
+            $value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            "HKEY_USERS\$sid\Environment|$name=$value"
+        }
+    }
+}
+EndPowerShell:
 
 StartPowerShell:
 # Checks default Windows PATH entries and repairs missing ones.
@@ -244,7 +282,7 @@ exit 0
 EndPowerShell:
 
 Comment: Verify Windows activation
-CMD: cscript c:\windows\system32\slmgr.vbs /xpr & cscript c:\windows\system32\slmgr.vbs /dlv
+CMD: C:\Windows\System32\cscript.exe c:\windows\system32\slmgr.vbs /xpr & C:\Windows\System32\cscript.exe c:\windows\system32\slmgr.vbs /dlv
 
 Comment: Check TPM and Secure Boot status
 StartPowershell:
@@ -1020,17 +1058,17 @@ Write-Host ("Total freed: {0} ({1} files)" -f (Format-Size $grandBytes), $grandF
 EndPowerShell:
 
 Comment: Windows Recovery Environment (Windows RE) status and enable
-CMD: reagentc.exe /info
-CMD: reagentc.exe /enable
+CMD: C:\Windows\System32\reagentc.exe /info
+CMD: C:\Windows\System32\reagentc.exe /enable
 
 Comment: Disable hidden file extensions
-cmd: reg.exe add "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "HideFileExt" /t REG_DWORD /d 0 /f
-cmd: reg.exe add "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\HideFileExt" /v "CheckedValue" /t REG_DWORD /d 0 /f
+REG: reg add "HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "HideFileExt" /t REG_DWORD /d 0 /f
+REG: reg add "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\HideFileExt" /v "CheckedValue" /t REG_DWORD /d 0 /f
 
 Comment: Verify WMI repository, repair & verify again
-CMD: winmgmt.exe /verifyrepository
-CMD: winmgmt.exe /salvagerepository
-CMD: winmgmt.exe /verifyrepository
+CMD: C:\Windows\System32\wbem\winmgmt.exe /verifyrepository
+CMD: C:\Windows\System32\wbem\winmgmt.exe /salvagerepository
+CMD: C:\Windows\System32\wbem\winmgmt.exe /verifyrepository
 
 Comment: To rebuild the performance counter library values
 CMD: "%WINDIR%\SYSTEM32\lodctr.exe /R"
@@ -1039,12 +1077,12 @@ CMD: "C:\Windows\SYSTEM32\lodctr.exe /R"
 CMD: "C:\Windows\SysWOW64\lodctr.exe /R"
 
 Comment: Resync performance counter library values to WMI as well
-CMD: winmgmt.exe /resyncperf
+CMD: C:\Windows\System32\wbem\winmgmt.exe /resyncperf
 
 Comment: Force policy removal
 C:\Windows\System32\GroupPolicyUsers
 C:\Windows\System32\GroupPolicy
-CMD: gpupdate.exe /force
+CMD: C:\Windows\System32\gpupdate.exe /force
 
 
 Comment: Restores and hardens selected Microsoft Defender Antivirus preferences.
@@ -1120,7 +1158,7 @@ if ($threats) {
 EndPowerShell:
 
 Comment: Enable recovery environment
-CMD: bcdedit.exe /set {default} recoveryenabled yes
+CMD: C:\Windows\System32\bcdedit.exe /set {default} recoveryenabled yes
 
 Comment: Restore original Windows services configuration
 StartPowerShell:
@@ -1139,19 +1177,38 @@ Set-Service -Name "Winmgmt" -StartupType Automatic
 Set-Service -Name "wuauserv" -StartupType Manual
 EndPowerShell:
 
-Comment: Reset the Windows Update download cache and update catalog database
-CMD: net.exe stop bits
-CMD: net.exe stop wuauserv
-CMD: net.exe stop cryptsvc
-CMD: net.exe stop msiserver
-CMD: rd /s /q "%SystemRoot%\SoftwareDistribution"
-CMD: rd /s /q "%SystemRoot%\System32\catroot2"
-CMD: net.exe start msiserver
-CMD: net.exe start cryptsvc
-CMD: net.exe start wuauserv
-CMD: net.exe start bits
+Comment: BITS reset
+Startbatch:
+@echo off
+C:\Windows\System32\net.exe stop BITS
+C:\Windows\System32\ipconfig.exe /flushdns
+ren "%programdata%\Microsoft\Network\Downloader\qmgr*.*" qmgr*.*.old
+C:\Windows\System32\net.exe start BITS
+Endbatch:
+cmd: C:\Windows\System32\bitsadmin.exe /reset /allusers
 
-Comment: Enable automatic restart after a restart, enable automatic updates
+Comment: Reset the Windows Update download cache and update catalog database
+CMD: C:\Windows\System32\net.exe stop wuauserv /y
+CMD: C:\Windows\System32\net.exe stop cryptSvc /y
+CMD: C:\Windows\System32\net.exe stop bits /y
+CMD: C:\Windows\System32\net.exe stop msiserver /y
+Unlock: C:\Windows\SoftwareDistribution
+CMD: ren C:\Windows\SoftwareDistribution SoftwareDistribution.old
+Unlock: C:\Windows\System32\CatRoot2
+CMD: ren C:\Windows\System32\CatRoot2 CatRoot2.old
+CMD: C:\Windows\System32\net.exe start wuauserv /y
+CMD: C:\Windows\System32\net.exe start cryptSvc /y
+CMD: C:\Windows\System32\net.exe start bits /y
+CMD: C:\Windows\System32\net.exe start msiserver /y
+
+Comment: Resets icon cache
+StartBatch:
+del /a /q "%localappdata%\IconCache.db"
+del /a /f /q "%localappdata%\Microsoft\Windows\Explorer\iconcache*"
+del /a /f /q "%localappdata%\Microsoft\Windows\Explorer\thumbcache*"
+EndBatch:
+
+Comment: Enable automatic restart after a crash, enable automatic updates
 StartRegedit:
 Windows Registry Editor Version 5.00
 
@@ -1169,24 +1226,14 @@ Powershell: Set-ExecutionPolicy Unrestricted -Scope CurrentUser -Force
 Comment: Fully reset the Windows network stack, WinHTTP proxy settings, DNS cache, and BITS transfer queue.
 Comment: Thanks to AdvancedSetup from Malwarebytes
 StartBatch:
-ipconfig.exe /flushdns
-ipconfig.exe /release
-netsh.exe winsock reset catalog
-netsh.exe int ip reset
-netsh.exe winhttp reset proxy
-netsh.exe winhttp reset autoproxy
-netsh.exe winhttp reset tracing
+C:\Windows\System32\ipconfig.exe /flushdns
+C:\Windows\System32\ipconfig.exe /release
+C:\Windows\System32\netsh.exe winsock reset catalog
+C:\Windows\System32\netsh.exe int ip reset
+C:\Windows\System32\netsh.exe winhttp reset proxy
+C:\Windows\System32\netsh.exe winhttp reset autoproxy
+C:\Windows\System32\netsh.exe winhttp reset tracing
 EndBatch:
-
-Comment: BITS reset
-Startbatch:
-@echo off
-net.exe stop BITS
-ipconfig.exe /flushdns
-ren "%programdata%\Microsoft\Network\Downloader\qmgr*.*" qmgr*.*.old
-net.exe start BITS
-Endbatch:
-cmd: bitsadmin.exe /reset /allusers
 
 Comment: Additional temp file removal
 C:\Windows\System32\config\systemprofile\AppData\Local\*.tmp
@@ -1198,8 +1245,8 @@ C:\Windows\SystemTemp\*
 C:\Windows\Prefetch\*
 
 Comment: System repair commands
-CMD: SFC.exe /scannow
-CMD: DISM.exe /Online /Cleanup-image /Restorehealth
+CMD: C:\Windows\System32\SFC.exe /scannow
+CMD: C:\Windows\System32\DISM.exe /Online /Cleanup-image /Restorehealth
 
 Comment: Remove set proxy servers
 RemoveProxy:
